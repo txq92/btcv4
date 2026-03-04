@@ -4,6 +4,7 @@
 
 import os
 import sys
+import csv
 import time
 from dotenv import load_dotenv
 
@@ -25,6 +26,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from typing import Dict, Tuple, List, Optional
 from datetime import datetime
+import concurrent.futures
+import threading
 
 MAX_ERR = 5
 
@@ -92,6 +95,28 @@ VOLATILITY_THRESHOLD = 2.0      # High volatility threshold
 
 # Global state
 error_counts: Dict[str, int] = {s: 0 for s in SYMBOLS}
+
+# ================= Signal Logging (Fix 2) =================
+SIGNAL_LOG_FILE = "signal_log.csv"
+SIGNAL_LOG_HEADERS = [
+    "timestamp", "symbol", "side", "signal_type", "tier", "score",
+    "entry", "sl", "tp1", "tp2", "tp3", "rr", "confidence",
+    "trend_3m", "trend_15m", "volume_ratio", "strategy"
+]
+
+def log_signal_to_csv(signal_data: dict):
+    """Log signal details to CSV for performance tracking."""
+    try:
+        file_exists = os.path.exists(SIGNAL_LOG_FILE)
+        with open(SIGNAL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=SIGNAL_LOG_HEADERS)
+            if not file_exists:
+                writer.writeheader()
+            # Only write fields that exist in headers
+            row = {k: signal_data.get(k, "") for k in SIGNAL_LOG_HEADERS}
+            writer.writerow(row)
+    except Exception as e:
+        print(f"Error logging signal to CSV: {e}")
 
 def get_signal_performance_stats(symbol: str = None, days: int = 7) -> dict:
     """Get signal performance statistics."""
@@ -226,30 +251,32 @@ def calculate_volume_profile(df: pd.DataFrame, price_range_pct: float = 0.5, num
         # Initialize volume by price level
         volume_by_price = np.zeros(num_bins)
         
-        # Calculate volume contribution to each price bin
-        for idx, row in df_subset.iterrows():
-            # Determine price range for this candle
-            #candle_min = min(row['open'], row['close'])
-            #candle_max = max(row['open'], row['close'])
-            candle_min = row['low']
-            candle_max = row['high']
+        # Vectorized calculation for volume profile instead of iterrows
+        lows = df_subset['low'].values
+        highs = df_subset['high'].values
+        volumes = df_subset['volume'].values
+
+        for i in range(num_bins):
+            bin_low = price_bins[i]
+            bin_high = price_bins[i+1]
             
-            candle_volume = row['volume']
-            
-            # Allocate volume to bins that this candle spans
-            for i in range(num_bins):
-                bin_low = price_bins[i]
-                bin_high = price_bins[i+1]
+            # Find candles that overlap with this bin
+            overlap_mask = (highs >= bin_low) & (lows <= bin_high)
+            if not overlap_mask.any():
+                continue
                 
-                # Check if candle overlaps with this bin
-                if candle_max >= bin_low and candle_min <= bin_high:
-                    # Calculate overlap
-                    overlap_low = max(candle_min, bin_low)
-                    overlap_high = min(candle_max, bin_high)
-                    overlap_pct = (overlap_high - overlap_low) / (candle_max - candle_min) if candle_max > candle_min else 1.0
-                    
-                    # Allocate volume based on overlap percentage
-                    volume_by_price[i] += candle_volume * overlap_pct
+            # Calculate overlap for each overlapping candle
+            overlap_lows = np.maximum(lows[overlap_mask], bin_low)
+            overlap_highs = np.minimum(highs[overlap_mask], bin_high)
+            
+            # Prevent division by zero
+            candle_ranges = highs[overlap_mask] - lows[overlap_mask]
+            safe_ranges = np.where(candle_ranges > 0, candle_ranges, 1.0)
+            
+            overlap_pcts = (overlap_highs - overlap_lows) / safe_ranges
+            
+            # Add contributed volumes to this bin
+            volume_by_price[i] = np.sum(volumes[overlap_mask] * overlap_pcts)
         
         # Find Point of Control (price level with highest volume)
         poc_idx = np.argmax(volume_by_price)
@@ -746,28 +773,46 @@ def detect_rsi_divergence(df: pd.DataFrame) -> List[Dict]:
     return sig
 
 def detect_engulfing(df: pd.DataFrame, lookback: int = 10) -> List[Dict]:
-    """Detect engulfing candlestick patterns."""
+    """Detect engulfing candlestick patterns with volume + ATR filters."""
     sig = []
     sub = df.tail(lookback+1).copy()
+
+    # Pre-calculate ATR and volume MA for filters
+    atr_series = calculate_atr(df)
+    vol_ma20 = df['volume'].rolling(20).mean()
+
     for i in range(1,len(sub)):
+        idx = sub.index[i]
         o1,c1 = sub.iloc[i-1]["open"], sub.iloc[i-1]["close"]
         o2,c2 = sub.iloc[i]["open"],  sub.iloc[i]["close"]
+
+        # Filter 1: Volume phải >= MA20 (volume confirmation)
+        vm = vol_ma20.loc[idx] if idx in vol_ma20.index else np.nan
+        if not np.isnan(vm) and sub.iloc[i]["volume"] < vm:
+            continue
+
+        # Filter 2: Body nến engulfing phải >= 0.5 * ATR (kích thước đủ lớn)
+        body_size = abs(c2 - o2)
+        atr_val = atr_series.loc[idx] if idx in atr_series.index else np.nan
+        if not np.isnan(atr_val) and body_size < 0.5 * atr_val:
+            continue
+
         # bullish engulfing near swing low
         is_bull = (c2>o2) and not (c1>o1) and (max(o2,c2)>=max(o1,c1)) and (min(o2,c2)<=min(o1,c1))
         near_sl = bool(sub.iloc[i]["swing_low"]) or bool(sub.iloc[i-1]["swing_low"])
         if is_bull and near_sl:
             sig.append({"type":"Engulfing","side":"bullish","at":sub.iloc[i]["open_time"],
-                        "price":float(c2), "note":"Bullish engulfing @ swing-low"})
+                        "price":float(c2), "note":"Bullish engulfing @ swing-low (vol+ATR confirmed)"})
         # bearish engulfing near swing high
         is_bear = (c2<o2) and not (c1<o1) and (max(o2,c2)>=max(o1,c1)) and (min(o2,c2)<=min(o1,c1))
         near_sh = bool(sub.iloc[i]["swing_high"]) or bool(sub.iloc[i-1]["swing_high"])
         if is_bear and near_sh:
             sig.append({"type":"Engulfing","side":"bearish","at":sub.iloc[i]["open_time"],
-                        "price":float(c2), "note":"Bearish engulfing @ swing-high"})
+                        "price":float(c2), "note":"Bearish engulfing @ swing-high (vol+ATR confirmed)"})
     return sig
 
 def detect_ema_cross(df: pd.DataFrame, within:int=20)->List[Dict]:
-    """Detect EMA crossover signals."""
+    """Detect EMA crossover signals (both slow 50/100 and fast 9/21)."""
     sig=[]
     e50=df["ema50"].values
     e100=df["ema100"].values
@@ -780,22 +825,51 @@ def detect_ema_cross(df: pd.DataFrame, within:int=20)->List[Dict]:
         if (e50[i-1]>=e100[i-1]) and (e50[i]<e100[i]):
             sig.append({"type":"EMA Cross","side":"bearish","at":df.iloc[i]["open_time"],
                         "price":float(df.iloc[i]["close"]), "note":"Death cross (50<100)"})
+
+    # Fix 4: Fast EMA Cross (9/21) — entry sớm, lọc theo trend EMA50/100
+    if "ema9" in df.columns and "ema21" in df.columns:
+        e9 = df["ema9"].values
+        e21 = df["ema21"].values
+        for i in range(start, n):
+            # Bullish fast cross: EMA9 cắt lên EMA21, CHỈ khi EMA50 > EMA100 (uptrend)
+            if (e9[i-1] <= e21[i-1]) and (e9[i] > e21[i]) and (e50[i] > e100[i]):
+                sig.append({"type":"EMA Cross","side":"bullish","at":df.iloc[i]["open_time"],
+                            "price":float(df.iloc[i]["close"]), "note":"Fast cross (9>21) in uptrend"})
+            # Bearish fast cross: EMA9 cắt xuống EMA21, CHỈ khi EMA50 < EMA100 (downtrend)
+            if (e9[i-1] >= e21[i-1]) and (e9[i] < e21[i]) and (e50[i] < e100[i]):
+                sig.append({"type":"EMA Cross","side":"bearish","at":df.iloc[i]["open_time"],
+                            "price":float(df.iloc[i]["close"]), "note":"Fast cross (9<21) in downtrend"})
+
     return sig
 
 def detect_macd_cross(df: pd.DataFrame, within:int=20)->List[Dict]:
-    """Detect MACD crossover signals."""
+    """Detect MACD crossover signals with noise reduction filters."""
     sig=[]
     n=len(df)
     start=max(1,n-within)
     ml=df["macd_line"].values
     sg=df["macd_signal"].values
+    hist=df["macd_hist"].values if "macd_hist" in df.columns else (ml - sg)
+
+    # Tính ngưỡng histogram tối thiểu (median of abs(hist) * 0.5)
+    abs_hist = np.abs(hist[~np.isnan(hist)])
+    hist_threshold = np.median(abs_hist) * 0.5 if len(abs_hist) > 0 else 0
+
     for i in range(start,n):
+        # Filter: |histogram| phải >= threshold (loại cross quá yếu)
+        if abs(hist[i]) < hist_threshold:
+            continue
+
+        # Bullish cross: MACD cắt lên signal, ưu tiên từ vùng âm (reversal mạnh hơn)
         if (ml[i-1]<=sg[i-1]) and (ml[i]>sg[i]):
+            zone = "from negative" if ml[i] < 0 else "in positive"
             sig.append({"type":"MACD Cross","side":"bullish","at":df.iloc[i]["open_time"],
-                        "value":float(ml[i]), "note":"MACD up-cross"})
+                        "value":float(ml[i]), "note":f"MACD up-cross ({zone})"})
+        # Bearish cross: MACD cắt xuống signal, ưu tiên từ vùng dương
         if (ml[i-1]>=sg[i-1]) and (ml[i]<sg[i]):
+            zone = "from positive" if ml[i] > 0 else "in negative"
             sig.append({"type":"MACD Cross","side":"bearish","at":df.iloc[i]["open_time"],
-                        "value":float(ml[i]), "note":"MACD down-cross"})
+                        "value":float(ml[i]), "note":f"MACD down-cross ({zone})"})
     return sig
 
 def detect_stochastic_rsi_signals(df: pd.DataFrame, within: int = 10) -> List[Dict]:
@@ -826,9 +900,10 @@ def detect_stochastic_rsi_signals(df: pd.DataFrame, within: int = 10) -> List[Di
         if pd.isna(current_k) or pd.isna(current_d) or pd.isna(prev_k) or pd.isna(prev_d):
             continue
         
-        # Bullish signal: oversold crossover (K crosses above D from oversold)
+        # Fix 3: Nới Stoch RSI — K đã từng < 20 (oversold sâu) và crossover lên
+        # Bullish signal: K từng oversold + K cắt lên D + K vẫn < 40
         if (prev_k <= prev_d and current_k > current_d and 
-            current_k < 30 and current_d < 30):  # Both in oversold territory
+            prev_k < 20 and current_k < 40):  # prev_k đã từng oversold sâu
             sig.append({
                 "type": "Stoch RSI", 
                 "side": "bullish", 
@@ -839,9 +914,10 @@ def detect_stochastic_rsi_signals(df: pd.DataFrame, within: int = 10) -> List[Di
                 "note": f"Oversold crossover K:{current_k:.1f} D:{current_d:.1f}"
             })
         
-        # Bearish signal: overbought crossover (K crosses below D from overbought)
+        # Fix 3: Nới Stoch RSI — K đã từng > 80 (overbought sâu) và crossover xuống
+        # Bearish signal: K từng overbought + K cắt xuống D + K vẫn > 60
         elif (prev_k >= prev_d and current_k < current_d and 
-              current_k > 70 and current_d > 70):  # Both in overbought territory
+              prev_k > 80 and current_k > 60):  # prev_k đã từng overbought sâu
             sig.append({
                 "type": "Stoch RSI", 
                 "side": "bearish", 
@@ -910,30 +986,40 @@ def detect_bollinger_signals(df: pd.DataFrame, within: int = 10) -> List[Dict]:
                     "note": f"Squeeze breakout below lower band {current['bb_lower']:.2f}"
                 })
         
-        # Mean reversion signals
-        # Bullish: Price touches lower band and bounces back
+        # Fix 5: Mean reversion signals + momentum filter (RSI/MACD)
+        # Bullish: Price touches lower band and bounces back + RSI > 30 hoặc MACD hist đang tăng
         elif (prev['close'] <= prev['bb_lower'] and current['close'] > prev['bb_lower'] and
               current['close'] > prev['close']):  # Bounce from lower band
-            sig.append({
-                "type": "BB Bounce", 
-                "side": "bullish", 
-                "at": current["open_time"],
-                "price": float(current["close"]),
-                "bb_level": float(prev['bb_lower']),
-                "note": f"Bounce from lower band {prev['bb_lower']:.2f}"
-            })
+            # Momentum check: RSI không quá yếu HOẶC MACD hist đang tăng
+            rsi_ok = 'rsi' in df.columns and df['rsi'].iloc[i] > 30
+            macd_rising = ('macd_hist' in df.columns and i >= 2 and
+                          df['macd_hist'].iloc[i] > df['macd_hist'].iloc[i-1])
+            if rsi_ok or macd_rising:
+                sig.append({
+                    "type": "BB Bounce", 
+                    "side": "bullish", 
+                    "at": current["open_time"],
+                    "price": float(current["close"]),
+                    "bb_level": float(prev['bb_lower']),
+                    "note": f"Bounce from lower band {prev['bb_lower']:.2f} (momentum confirmed)"
+                })
         
-        # Bearish: Price touches upper band and reverses
+        # Bearish: Price touches upper band and reverses + RSI < 70 hoặc MACD hist đang giảm
         elif (prev['close'] >= prev['bb_upper'] and current['close'] < prev['bb_upper'] and
               current['close'] < prev['close']):  # Rejection from upper band
-            sig.append({
-                "type": "BB Bounce", 
-                "side": "bearish", 
-                "at": current["open_time"],
-                "price": float(current["close"]),
-                "bb_level": float(prev['bb_upper']),
-                "note": f"Rejection from upper band {prev['bb_upper']:.2f}"
-            })
+            # Momentum check: RSI không quá mạnh HOẶC MACD hist đang giảm
+            rsi_ok = 'rsi' in df.columns and df['rsi'].iloc[i] < 70
+            macd_falling = ('macd_hist' in df.columns and i >= 2 and
+                           df['macd_hist'].iloc[i] < df['macd_hist'].iloc[i-1])
+            if rsi_ok or macd_falling:
+                sig.append({
+                    "type": "BB Bounce", 
+                    "side": "bearish", 
+                    "at": current["open_time"],
+                    "price": float(current["close"]),
+                    "bb_level": float(prev['bb_upper']),
+                    "note": f"Rejection from upper band {prev['bb_upper']:.2f} (momentum confirmed)"
+                })
     
     return sig
 
@@ -1002,32 +1088,36 @@ def plot_price(df: pd.DataFrame, signals: List[Dict], save_path: str, interval: 
 
 # ================= Messaging =================
 def send_telegram_message(message: str, max_retries: int = 3) -> bool:
-    """Send message to Telegram."""
+    """Send message to Telegram (runs in background)."""
     if not TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM_BOT_TOKEN" in TELEGRAM_BOT_TOKEN:
         return False
         
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_notification": True
-    }
-    
-    for attempt in range(max_retries):
-        try:
-            r = requests.post(url, data=payload, timeout=TELEGRAM_TIMEOUT)
-            r.raise_for_status()
-            return True
-        except requests.exceptions.RequestException as e:
-            print(f"Telegram send error (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(RETRY_DELAY)
-    
-    return False
+    def _send_task():
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_notification": True
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                r = requests.post(url, data=payload, timeout=TELEGRAM_TIMEOUT)
+                r.raise_for_status()
+                return True
+            except requests.exceptions.RequestException as e:
+                print(f"Telegram send error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(RETRY_DELAY)
+        return False
+
+    # Chạy ở background thread để tránh block main loop
+    threading.Thread(target=_send_task, daemon=True).start()
+    return True
 
 def send_telegram_photo(photo_path: str, caption: str = "", max_retries: int = 3) -> bool:
-    """Send photo to Telegram."""
+    """Send photo to Telegram (runs in background)."""
     if not TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM_BOT_TOKEN" in TELEGRAM_BOT_TOKEN:
         return False
         
@@ -1035,27 +1125,30 @@ def send_telegram_photo(photo_path: str, caption: str = "", max_retries: int = 3
         print(f"Photo file not found: {photo_path}")
         return False
         
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    def _send_photo_task():
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        
+        for attempt in range(max_retries):
+            try:
+                with open(photo_path, "rb") as photo:
+                    files = {"photo": photo}
+                    data = {
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": caption,
+                        "parse_mode": "HTML",
+                        "disable_notification": True
+                    }
+                    r = requests.post(url, data=data, files=files, timeout=TELEGRAM_TIMEOUT)
+                    r.raise_for_status()
+                    return True
+            except (requests.exceptions.RequestException, IOError) as e:
+                print(f"Telegram photo send error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(RETRY_DELAY)
+        return False
     
-    for attempt in range(max_retries):
-        try:
-            with open(photo_path, "rb") as photo:
-                files = {"photo": photo}
-                data = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                    "disable_notification": True
-                }
-                r = requests.post(url, data=data, files=files, timeout=TELEGRAM_TIMEOUT)
-                r.raise_for_status()
-                return True
-        except (requests.exceptions.RequestException, IOError) as e:
-            print(f"Telegram photo send error (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(RETRY_DELAY)
-    
-    return False
+    threading.Thread(target=_send_photo_task, daemon=True).start()
+    return True
 
 # ================= SL/TP & Helpers =================
 def compute_sl_tp(dfp: pd.DataFrame, side: str, symbol: str = "BTCUSDT") -> dict:
@@ -1081,8 +1174,8 @@ def compute_sl_tp(dfp: pd.DataFrame, side: str, symbol: str = "BTCUSDT") -> dict
             # Enhanced SL calculation with ATR buffer
             if l_idx:
                 swing_low = float(dfp.loc[l_idx[-1], "low"])
-                atr_buffer = current_atr * 0.5  # ATR buffer
-                sl = swing_low - atr_buffer
+                atr_buffer = current_atr * 1.0   # tối thiểu 1×ATR
+                sl = swing_low - atr_buffer  # FIX: gán SL cho LONG
             else:
                 # Fallback to ATR-based SL
                 sl = entry - (current_atr * config["atr_sl_mult"])
@@ -1616,7 +1709,7 @@ def detect_pin_bar(df: pd.DataFrame, lookback: int = 12,
 
 
 # ================= Main Processing =================
-def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple[bool, str]:
+def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict, last_signal_times: dict = None) -> Tuple[bool, str, Optional[Dict]]:
     """Process a single symbol to detect and report trading signals.
     
     Args:
@@ -1625,7 +1718,7 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
         last_signal_ids: Dict tracking the last signal sent for each symbol
         
     Returns:
-        Tuple of (success, message)
+        Tuple of (success, message, recommendation_or_None)
     """
     try:
         save_paths = get_save_paths(symbol)
@@ -1635,6 +1728,8 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
         
         df = only_closed(df)
 
+        df["ema9"] = ema(df["close"], 9)    # Fix 4: Fast EMA
+        df["ema21"] = ema(df["close"], 21)   # Fix 4: Fast EMA
         df["ema50"] = ema(df["close"], 50)
         df["ema100"] = ema(df["close"], 100)
         df["rsi"] = rsi(df["close"], 14)
@@ -1706,6 +1801,16 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
             signal_id = f"{symbol}_{latest['type']}_{latest['side']}_{latest['at']}"
             
             if first_run or signal_id != last_signal_ids.get(symbol):
+                # Cooldown: chặn tín hiệu cùng coin cùng hướng trong 15 phút
+                if last_signal_times is not None and not first_run:
+                    cooldown_key = f"{symbol}_{latest['side']}"
+                    last_sent = last_signal_times.get(cooldown_key)
+                    if last_sent:
+                        elapsed_min = (datetime.now(TZ) - last_sent).total_seconds() / 60
+                        if elapsed_min < 15:
+                            print(f"⏳ {symbol}: Cooldown {elapsed_min:.0f}/15 phút cho {latest['side']}")
+                            return True, "Cooldown active", recommendation
+
                 side = latest['side']
                 rr_data = compute_sl_tp(dfp, side, symbol)
                 
@@ -1781,7 +1886,7 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
 
                     if no_trade_near_poc:
                         print(f"❌ {symbol}: Chặn trade sát POC nếu không phải breakout")
-                        return True, "Filtered near POC"
+                        return True, "Filtered near POC", recommendation
 
                     signal_time = latest['at'].strftime('%H:%M:%S')
                     
@@ -1805,7 +1910,7 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
                     # If tier is None, signal doesn't meet minimum criteria
                     if tier is None:
                         print(f"❌ {symbol}: Signal score too low ({signal_score}/100)")
-                        return True, f"Low score: {signal_score}/100"
+                        return True, f"Low score: {signal_score}/100", recommendation
                     
                     # Get position size recommendation based on tier
                     tier_config = {
@@ -1829,15 +1934,7 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
                         risk_amount = abs(entry_price - sl_price)
                         reward_amount = abs(tp1_price - entry_price)
                         
-                        # Risk percent should always show as positive (it's a loss)
-                        # But we need to show the direction correctly
-                        if side == "bullish":
-                            # For LONG: SL is below entry, show as negative percent
-                            risk_percent = ((sl_price - entry_price) / entry_price) * 100
-                        else:
-                            # For SHORT: SL is above entry, show as positive percent  
-                            risk_percent = ((sl_price - entry_price) / entry_price) * 100
-                        
+                        risk_percent = (risk_amount / entry_price) * 100
                         reward_percent = (reward_amount / entry_price) * 100
                     else:
                         risk_percent = reward_percent = 0
@@ -1939,6 +2036,29 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
                         send_telegram_photo(save_paths["price_15m"], f"{symbol} Price 15m")
                     
                     last_signal_ids[symbol] = signal_id
+                    if last_signal_times is not None:
+                        last_signal_times[f"{symbol}_{side}"] = datetime.now(TZ)
+
+                    # Fix 2: Log signal to CSV for performance tracking
+                    log_signal_to_csv({
+                        "timestamp": datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                        "symbol": symbol,
+                        "side": side,
+                        "signal_type": latest['type'],
+                        "tier": tier,
+                        "score": signal_score,
+                        "entry": fmt(entry_price),
+                        "sl": fmt(sl_price),
+                        "tp1": fmt(rr_data['tp1']),
+                        "tp2": fmt(rr_data['tp2']),
+                        "tp3": fmt(rr_data['tp3']),
+                        "rr": f"{rr_data['rr']:.2f}" if rr_data['rr'] else "N/A",
+                        "confidence": f"{rr_data['confidence']:.2f}",
+                        "trend_3m": result3['label'],
+                        "trend_15m": result15['label'],
+                        "volume_ratio": f"{rr_data['volume_ratio']:.2f}",
+                        "strategy": rr_data['strategy']
+                    })
 
                 else:
                     filter_reasons = []
@@ -1950,17 +2070,19 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict) -> Tuple
                     
                     print(f"❌ {symbol}: Signal filtered - {', '.join(filter_reasons)}")
         
-        return True, "Success"
+        # Fix 1: Return recommendation to avoid duplicate API calls
+        return True, "Success", recommendation
     except Exception as e:
         print(f"[ERROR] Processing {symbol}: {e}")
         error_counts[symbol] += 1
-        return False, str(e)
+        return False, str(e), None
 
 
 
 def main():
     """Main loop that processes all configured symbols."""
     last_signal_ids = {symbol: None for symbol in SYMBOLS}
+    last_signal_times = {}  # Cooldown tracking: {"SYMBOL_side": datetime}
     last_strong_recommendations = {symbol: None for symbol in SYMBOLS}
     last_performance_report_time = datetime.now()
     performance_report_interval = 6 * 3600  # 6 hours in seconds
@@ -1987,96 +2109,59 @@ def main():
             all_recommendations = []
             
 
-            for symbol in SYMBOLS:
-                if error_counts.get(symbol, 0) >= MAX_ERR:
-                    print(f"⏭️ Skip {symbol} (too many errors)")
-                    continue
+            print("🚀 Process all configured symbols concurrently...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(SYMBOLS)) as executor:
+                # Submit all symbols directly
+                future_to_symbol = {
+                    executor.submit(
+                        process_symbol, symbol, first_run, last_signal_ids, last_signal_times
+                    ): symbol
+                    for symbol in SYMBOLS if error_counts.get(symbol, 0) < MAX_ERR
+                }
                 
-                success, message = process_symbol(symbol, first_run, last_signal_ids)
-                if success:
-                    # Get current recommendation for this symbol
-                    # We need to generate it again (simplified version)
+                # Handle results dynamically as they complete
+                for future in concurrent.futures.as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
                     try:
-                        # Chỉ dựng lại dữ liệu / khuyến nghị khi bật cờ
-                        if SEND_MARKET_DIRECTION:
-                            df = get_klines(symbol=symbol)
-                            df = only_closed(df)
-                            df["ema50"] = ema(df["close"], 50)
-                            df["ema100"] = ema(df["close"], 100)
-                            df["rsi"] = rsi(df["close"], 14)
-                            macd_line, macd_signal, macd_hist = macd(df["close"], 12, 26, 9)
-                            df["macd_line"] = macd_line
-                            df["macd_signal"] = macd_signal
-                            df["macd_hist"] = macd_hist
-                            df["vol_ma20"] = df["volume"].rolling(20).mean()
-                            df = swing_points(df, window=3)
-                            dfp = df.tail(120).copy()
-
-                            df15 = get_klines_15m(symbol=symbol)
-                            df15 = only_closed(df15)
-                            df15["ema50"] = ema(df15["close"], 50)
-                            df15["ema100"] = ema(df15["close"], 100)
-                            df15["rsi"] = rsi(df15["close"], 14)
-                            macd_line15, macd_signal15, macd_hist15 = macd(df15["close"], 12, 26, 9)
-                            df15["macd_line"] = macd_line15
-                            df15["macd_signal"] = macd_signal15
-                            df15["macd_hist"] = macd_hist15
-                            df15["vol_ma20"] = df15["volume"].rolling(20).mean()
-                            df15 = swing_points(df15, window=3)
-                            dfp15 = df15.tail(120).copy()
-
-                            result3 = score_trend(dfp)
-                            result15 = score_trend(dfp15)
-                            signals = collect_reversal_signals(dfp)
-
-                            volume_profile = calculate_volume_profile(dfp, price_range_pct=2.0)
-                            market_structure = analyze_market_structure(dfp)
-                            confluence_analysis = calculate_signal_confluence(signals, result3['last_close'])
-
-                            recommendation = generate_trading_recommendation(
-                                symbol, result3, result15, market_structure, volume_profile, confluence_analysis
-                            )
-
-                            # luôn append khi đã có recommendation
-                            all_recommendations.append(recommendation)
-
-                            # gửi thông báo strong recommendation (nếu có)
-                            if recommendation['action'] in ['STRONG LONG', 'STRONG SHORT']:
-                                last_rec = last_strong_recommendations.get(symbol)
-                                current_rec_id = f"{symbol}_{recommendation['action']}_{recommendation['confidence']:.0f}"
-                                if last_rec != current_rec_id:
-                                    action_emoji = "📈🟢" if "LONG" in recommendation['action'] else "📉🔴"
-                                    rec_msg_parts = [
-                                        f"<b>{action_emoji} {symbol} {recommendation['action']}</b>",
-                                        f"🎯 Confidence: <b>{recommendation['confidence']:.0f}%</b> | Risk: {recommendation['risk_level']}",
-                                        f"📊 Bias Score: {recommendation['bias_score']:.1f}/10",
-                                        f"💡 Key Reasons:",
-                                    ]
-                                    for reason in recommendation['reasons'][:3]:
-                                        rec_msg_parts.append(f"   • {reason}")
-                                    rec_msg_parts.extend([
-                                        "",
-                                        "⚡ Market Conditions:",
-                                        f"   📊 Structure: {'✅' if recommendation['structure_supports'] else '❌'} | "
-                                        f"Volume: {'✅' if recommendation['volume_supports'] else '❌'} | "
-                                        f"MTF: {'✅' if recommendation['timeframe_alignment'] else '❌'}",
-                                        f"📋 Price: {result3['last_close']:.2f} | RSI: {result3['rsi']:.1f}",
-                                    ])
-                                    rec_msg = "\n".join(rec_msg_parts)
-                                    send_telegram_message(rec_msg)
-                                    last_strong_recommendations[symbol] = current_rec_id
-                                    print(f"📢 Sent {recommendation['action']} recommendation for {symbol}")
+                        success, message, recommendation = future.result()
+                        if success:
+                            if SEND_MARKET_DIRECTION and recommendation is not None:
+                                all_recommendations.append(recommendation)
+                                # Lọc tín hiệu mạnh
+                                if recommendation['action'] in ['STRONG LONG', 'STRONG SHORT']:
+                                    last_rec = last_strong_recommendations.get(symbol)
+                                    current_rec_id = f"{symbol}_{recommendation['action']}_{recommendation['confidence']:.0f}"
+                                    if last_rec != current_rec_id:
+                                        action_emoji = "📈🟢" if "LONG" in recommendation['action'] else "📉🔴"
+                                        rec_msg_parts = [
+                                            f"<b>{action_emoji} {symbol} {recommendation['action']}</b>",
+                                            f"🎯 Confidence: <b>{recommendation['confidence']:.0f}%</b> | Risk: {recommendation['risk_level']}",
+                                            f"📊 Bias Score: {recommendation['bias_score']:.1f}/10",
+                                            f"💡 Key Reasons:",
+                                        ]
+                                        for reason in recommendation['reasons'][:3]:
+                                            rec_msg_parts.append(f"   • {reason}")
+                                        rec_msg_parts.extend([
+                                            "",
+                                            "⚡ Market Conditions:",
+                                            f"   📊 Structure: {'✅' if recommendation['structure_supports'] else '❌'} | "
+                                            f"Volume: {'✅' if recommendation['volume_supports'] else '❌'} | "
+                                            f"MTF: {'✅' if recommendation['timeframe_alignment'] else '❌'}",
+                                        ])
+                                        rec_msg = "\n".join(rec_msg_parts)
+                                        send_telegram_message(rec_msg)
+                                        last_strong_recommendations[symbol] = current_rec_id
+                                        print(f"📢 Sent {recommendation['action']} recommendation for {symbol}")
+                        else:
+                            print(f"Failed to process {symbol}: {message}")
                     except Exception as e:
-                        print(f"Error generating recommendation for {symbol}: {e}")
-                    
-                    time.sleep(SYMBOL_DELAY)  # Delay only after successful processing
-                else:
-                    print(f"Failed to process {symbol}: {message}")
-            
+                        print(f"Unhandled exception extracting result for {symbol}: {e}")
+
             # Send periodic performance report (every 6 hours)
             current_time = datetime.now()
             if (current_time - last_performance_report_time).total_seconds() >= performance_report_interval:
                 print("📊 Sending periodic performance report...")
+                # Note: Do not run report sending threading async as we need to update `last_performance_report_time`
                 if send_performance_summary_to_telegram(period_days=7):
                     last_performance_report_time = current_time
                     print("✅ Performance report sent successfully")
