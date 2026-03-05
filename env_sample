@@ -1,0 +1,11 @@
+
+# ================== BINANCE API  fake ==================
+BINANCE_API_KEY=qHDEy34FRAMg6MTmPUleKbRT9FNcccwWHZmWo5ablq0YNa2arm7P8o769mFayuPphk2
+BINANCE_API_SECRET=SdjvDKHw5Tfev9PKAD20uZieFbYu1cccxlHgznerNj1pf5ZoAl94c6c1IV4sRGYLX3v
+
+# Testnet (Demo) - đặt True để test không mất tiền
+TESTNET_MODE=True
+
+# ================== TELEGRAM BTCv4 ==================
+TELEGRAM_TOKEN="8226246719:x"
+TELEGRAM_CHAT_ID="-4985792151"

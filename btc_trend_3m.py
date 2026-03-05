@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Advanced cryptocurrency trend detector with reversal signals."""
+"""Advanced cryptocurrency trend detector with reversal signals + Auto-Trade."""
 
 import os
 import sys
 import csv
 import time
+import math
+import socket
+import logging
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,20 +23,24 @@ import numpy as np
 import pandas as pd
 import pytz
 import requests
+import requests as req_lib
+import ccxt
+import telebot
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from typing import Dict, Tuple, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import concurrent.futures
 import threading
+from collections import deque
 
 MAX_ERR = 5
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_TOKEN')
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN not found in .env file")
+    raise ValueError("TELEGRAM_TOKEN not found in .env file")
 
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 if not TELEGRAM_CHAT_ID:
@@ -92,9 +99,67 @@ SYMBOL_SPECIFIC_RR = {
 VOLUME_THRESHOLD = 1.2          # Volume ratio for confidence boost
 VOLATILITY_THRESHOLD = 2.0      # High volatility threshold
 
+# ================= AUTO-TRADE CONFIG =================
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+
+TRADE_AMOUNT_USDT = 50.0        # Vốn mỗi lệnh (USDT)
+GLOBAL_LEVERAGE = 25            # Đòn bẩy
+MAX_POSITIONS = 3               # Số vị thế tối đa
+TRADING_ENABLED = True          # Bật/tắt auto trade
+TRAILING_ENABLED = True         # Bật/tắt trailing SL
+USE_TESTNET = os.environ.get("TESTNET_MODE", "True").strip().lower() == "true"
+AUTO_TRADE_TIERS = ["PREMIUM", "STANDARD"]  # Chỉ tier này mới auto trade
+
+# ================= LOGGING =================
+logging.basicConfig(
+    filename='bot_trend_3m_log.txt',
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logging.info("=== BTC TREND 3M BOT KHỞI ĐỘNG ===")
+
+signals_log = deque(maxlen=2000)
 
 # Global state
 error_counts: Dict[str, int] = {s: 0 for s in SYMBOLS}
+
+# ================= BINANCE FUTURES CONNECTION =================
+tg_bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+TG_CHAT_ID = int(TELEGRAM_CHAT_ID)
+
+print("🔧 Đang kết nối Binance Futures API...")
+exchange = ccxt.binance({
+    'apiKey': BINANCE_API_KEY,
+    'secret': BINANCE_API_SECRET,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'},
+})
+
+if USE_TESTNET:
+    exchange.enableDemoTrading(True)
+    print("🔧 Sử dụng DEMO TRADING Binance Futures")
+
+# Convert symbols to ccxt format for pairs
+CCXT_PAIRS = [s.replace('USDT', '/USDT') for s in SYMBOLS]
+
+try:
+    ticker = exchange.fetch_ticker('BTC/USDT')
+    print(f"✅ Kết nối API thành công! Giá BTC: {ticker['last']}")
+except Exception as e:
+    print(f"❌ LỖI KẾT NỐI API: {e}")
+
+# Set Isolated Margin + Leverage cho tất cả pairs
+for _sym in CCXT_PAIRS:
+    try:
+        exchange.set_margin_mode('isolated', _sym)
+    except:
+        pass
+    try:
+        exchange.set_leverage(GLOBAL_LEVERAGE, _sym)
+    except:
+        pass
 
 # ================= Signal Logging (Fix 2) =================
 SIGNAL_LOG_FILE = "signal_log.csv"
@@ -1150,6 +1215,251 @@ def send_telegram_photo(photo_path: str, caption: str = "", max_retries: int = 3
     threading.Thread(target=_send_photo_task, daemon=True).start()
     return True
 
+# ==============================================================================
+# ========== LOGIC VÀO LỆNH & STOP LOSS ==========
+# ==============================================================================
+
+def execute_trade(symbol_ccxt, side, entry_price, sl_price, tp1_price):
+    """
+    Đặt lệnh Market + SL + TP1 trên Binance Futures.
+    
+    Args:
+        symbol_ccxt: Cặp giao dịch dạng ccxt, ví dụ 'BTC/USDT'
+        side: 'buy' (LONG) hoặc 'sell' (SHORT)
+        entry_price: Giá vào lệnh dự kiến
+        sl_price: Giá cắt lỗ
+        tp1_price: Giá chốt lời TP1
+    
+    Returns:
+        Tuple (order, quantity_str, actual_sl, actual_tp, error_msg)
+    """
+    try:
+        # Kiểm tra vị thế hiện có
+        positions = exchange.fetch_positions([symbol_ccxt])
+        for p in positions:
+            if float(p.get('contracts', 0) or 0) != 0:
+                return None, "0", 0, 0, f"Đã có vị thế {p.get('side', 'unknown')}"
+
+        # Kiểm tra số lượng vị thế mở
+        all_positions = exchange.fetch_positions()
+        open_positions = sum(1 for p in all_positions if float(p.get('contracts', 0) or 0) != 0)
+        if open_positions >= MAX_POSITIONS:
+            return None, "0", 0, 0, f"Đạt giới hạn {MAX_POSITIONS} vị thế"
+
+        # Kiểm tra số dư
+        balance = exchange.fetch_balance()
+        usdt_free = float(balance['free'].get('USDT', 0))
+        if usdt_free < TRADE_AMOUNT_USDT:
+            return None, "0", 0, 0, f"Số dư không đủ ({usdt_free:.2f} USDT)"
+
+        # Tính Volume
+        total_notional_usdt = TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE
+        quantity = float(exchange.amount_to_precision(symbol_ccxt, total_notional_usdt / entry_price))
+
+        # Precision cho SL/TP
+        sl = float(exchange.price_to_precision(symbol_ccxt, sl_price))
+        tp = float(exchange.price_to_precision(symbol_ccxt, tp1_price))
+
+        # Đặt lệnh Market
+        order = exchange.create_market_order(symbol_ccxt, side, quantity)
+        actual_entry = float(order.get('price') or exchange.fetch_ticker(symbol_ccxt)['last'])
+
+        # Đặt SL & TP
+        sl_side = 'sell' if side == 'buy' else 'buy'
+        tp_side = 'sell' if side == 'buy' else 'buy'
+
+        exchange.create_order(symbol_ccxt, 'stop_market', sl_side, quantity,
+                              params={'stopPrice': sl, 'reduceOnly': True})
+        exchange.create_order(symbol_ccxt, 'take_profit_market', tp_side, quantity,
+                              params={'stopPrice': tp, 'reduceOnly': True})
+
+        # Tính % SL & % TP
+        if side == 'buy':
+            sl_percent = (actual_entry - sl) / actual_entry * 100
+            tp_percent = (tp - actual_entry) / actual_entry * 100
+        else:
+            sl_percent = (sl - actual_entry) / actual_entry * 100
+            tp_percent = (actual_entry - tp) / actual_entry * 100
+
+        rr = round(tp_percent / sl_percent, 1) if sl_percent > 0 else 2.0
+
+        logging.info(f"OPEN {'LONG' if side == 'buy' else 'SHORT'} {symbol_ccxt} | Entry: {actual_entry:.6f} | SL: -{sl_percent:.3f}% | TP: +{tp_percent:.3f}%")
+
+        return order, str(quantity), sl, tp, ""
+
+    except Exception as e:
+        logging.error(f"Execute trade error {symbol_ccxt}: {e}")
+        return None, "0", 0, 0, str(e)
+
+# ==============================================================================
+# ========== TRAILING SL ==========
+# ==============================================================================
+
+def manage_trailing_sl():
+    """
+    Trailing SL logic:
+    - Khi giá đạt RR1 → dời SL về entry (Bước 1 - hòa vốn)
+    - Khi giá đạt RR2 → dời SL về RR1 (Bước 2 - khóa lời)
+    """
+    if not TRAILING_ENABLED:
+        return
+
+    try:
+        positions = exchange.fetch_positions()
+        if not positions:
+            return
+
+        for pos in positions:
+            contracts = float(pos.get('contracts', 0) or 0)
+            if contracts == 0:
+                continue
+
+            sym = pos.get('symbol', '')
+            entry_px = float(pos.get('entryPrice', 0) or 0)
+            pos_side = pos.get('side', '').lower()
+            if entry_px == 0 or not pos_side:
+                continue
+
+            # Lấy nến gần nhất
+            try:
+                ohlcv = exchange.fetch_ohlcv(sym, '3m', limit=5)
+                if len(ohlcv) < 2:
+                    continue
+                last_close = ohlcv[-2][4]
+            except:
+                continue
+
+            # Tìm SL & TP order hiện tại
+            open_orders = exchange.fetch_open_orders(sym)
+            current_sl = 0
+            sl_order_id = None
+            current_tp = 0
+            for o in open_orders:
+                if o.get('type') in ['stop_market', 'stop'] and o.get('reduceOnly', False):
+                    stop_price = o.get('stopPrice') or o.get('triggerPrice') or 0
+                    if float(stop_price) > 0 and sl_order_id is None:
+                        current_sl = float(stop_price)
+                        sl_order_id = o['id']
+                elif o.get('type') in ['take_profit_market', 'take_profit'] and o.get('reduceOnly', False):
+                    tp_price = o.get('stopPrice') or o.get('triggerPrice') or 0
+                    if float(tp_price) > 0:
+                        current_tp = float(tp_price)
+
+            if not sl_order_id or current_sl == 0:
+                continue
+
+            # Tính original risk từ TP (R:R 1:2 → risk = |TP - entry| / 2)
+            if current_tp > 0:
+                original_risk = abs(current_tp - entry_px) / 2.0
+            else:
+                original_risk = abs(entry_px - current_sl)
+
+            if original_risk == 0:
+                continue
+
+            if pos_side == 'long':
+                rr1 = entry_px + original_risk
+                rr2 = entry_px + original_risk * 2
+            else:
+                rr1 = entry_px - original_risk
+                rr2 = entry_px - original_risk * 2
+
+            # Logic trailing
+            new_sl = None
+            trail_step = ""
+            if pos_side == 'long':
+                if last_close >= rr2 and current_sl < rr1:
+                    new_sl = float(exchange.price_to_precision(sym, rr1))
+                    trail_step = "Bước 2"
+                elif last_close >= rr1 and current_sl < entry_px:
+                    new_sl = float(exchange.price_to_precision(sym, entry_px))
+                    trail_step = "Bước 1"
+            else:
+                if last_close <= rr2 and current_sl > rr1:
+                    new_sl = float(exchange.price_to_precision(sym, rr1))
+                    trail_step = "Bước 2"
+                elif last_close <= rr1 and current_sl > entry_px:
+                    new_sl = float(exchange.price_to_precision(sym, entry_px))
+                    trail_step = "Bước 1"
+
+            if new_sl:
+                try:
+                    exchange.cancel_order(sl_order_id, sym)
+                    sl_side = 'sell' if pos_side == 'long' else 'buy'
+                    exchange.create_order(sym, 'stop_market', sl_side, contracts,
+                                          params={'stopPrice': new_sl, 'reduceOnly': True})
+
+                    side_text = pos_side.upper()
+                    if trail_step == "Bước 1":
+                        step_desc = "Giá đạt RR1 → Dời SL về Entry (hòa vốn)"
+                    else:
+                        step_desc = "Giá đạt RR2 → Dời SL về RR1 (khóa lời)"
+
+                    trail_msg = f"🛡️ <b>TRAILING SL</b> ({trail_step})\n📍 {sym} | {side_text}\n📊 {step_desc}\n💰 Entry: {entry_px:.6f}\n🔄 SL cũ: {current_sl:.6f} → SL mới: <b>{new_sl:.6f}</b>\n📈 Giá hiện tại: {last_close:.6f}"
+                    print(f"🛡️ Trail SL {sym} ({trail_step}) → {new_sl}")
+                    send_telegram_message(trail_msg)
+                    logging.info(f"TRAIL {trail_step} {sym} {side_text} | SL: {current_sl} → {new_sl}")
+                except Exception as e:
+                    print(f"⚠️ Trail SL Error {sym}: {e}")
+    except Exception as e:
+        print(f"⚠️ Trailing SL Error: {e}")
+        logging.error(f"Trailing SL Error: {e}")
+
+# ==============================================================================
+# ========== DỌN DẸP LỆNH MỒ CÔI ==========
+# ==============================================================================
+
+def cleanup_orphan_orders():
+    """
+    Khi SL trigger → TP vẫn còn mở (và ngược lại).
+    Tìm các symbol không còn vị thế nhưng vẫn có lệnh SL/TP mở → hủy.
+    """
+    try:
+        positions = exchange.fetch_positions()
+        active_symbols = set()
+        for p in positions:
+            if float(p.get('contracts', 0) or 0) != 0:
+                active_symbols.add(p.get('symbol', ''))
+
+        for sym in CCXT_PAIRS:
+            if sym in active_symbols:
+                continue
+
+            try:
+                open_orders = exchange.fetch_open_orders(sym)
+                if not open_orders:
+                    continue
+
+                orphan_orders = [
+                    o for o in open_orders
+                    if o.get('reduceOnly', False) and
+                    o.get('type') in ['stop_market', 'stop', 'take_profit_market', 'take_profit']
+                ]
+
+                if not orphan_orders:
+                    continue
+
+                cancelled_count = 0
+                for o in orphan_orders:
+                    try:
+                        exchange.cancel_order(o['id'], sym)
+                        cancelled_count += 1
+                    except Exception as e:
+                        print(f"⚠️ Không hủy được lệnh {o['id']} {sym}: {e}")
+
+                if cancelled_count > 0:
+                    msg = f"🧹 <b>DỌN LỆNH MỒ CÔI</b>\n📍 {sym}\n❌ Đã hủy {cancelled_count} lệnh SL/TP còn sót\n💡 Vị thế đã đóng (SL/TP đã trigger)"
+                    print(f"🧹 Cleanup {sym}: hủy {cancelled_count} lệnh mồ côi")
+                    send_telegram_message(msg)
+                    logging.info(f"CLEANUP {sym}: cancelled {cancelled_count} orphan orders")
+
+            except Exception as e:
+                print(f"⚠️ Cleanup error {sym}: {e}")
+
+    except Exception as e:
+        print(f"⚠️ Cleanup orphan orders error: {e}")
+        logging.error(f"Cleanup orphan orders error: {e}")
+
 # ================= SL/TP & Helpers =================
 def compute_sl_tp(dfp: pd.DataFrame, side: str, symbol: str = "BTCUSDT") -> dict:
     """Enhanced SL/TP computation with ATR buffer and multiple TP levels."""
@@ -2035,6 +2345,46 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict, last_sig
                         send_telegram_photo(save_paths["price_3m"], f"{symbol} Price 3m")
                         send_telegram_photo(save_paths["price_15m"], f"{symbol} Price 15m")
                     
+                    # ===== AUTO-TRADE: Vào lệnh tự động cho PREMIUM & STANDARD =====
+                    if TRADING_ENABLED and tier in AUTO_TRADE_TIERS:
+                        trade_side = 'buy' if side == 'bullish' else 'sell'
+                        symbol_ccxt = symbol.replace('USDT', '/USDT')
+                        side_text = 'LONG' if trade_side == 'buy' else 'SHORT'
+                        total_vol = TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE
+                        
+                        print(f"🤖 Auto-Trade: {side_text} {symbol_ccxt} (Tier: {tier})")
+                        
+                        res, sz, sl_actual, tp_actual, err = execute_trade(
+                            symbol_ccxt, trade_side, entry_price, sl_price, tp1_price
+                        )
+                        
+                        if res and not err:
+                            actual_entry = res.get('price') or entry_price
+                            # Tính % SL & TP
+                            if trade_side == 'buy':
+                                sl_pct = (actual_entry - sl_actual) / actual_entry * 100
+                                tp_pct = (tp_actual - actual_entry) / actual_entry * 100
+                            else:
+                                sl_pct = (sl_actual - actual_entry) / actual_entry * 100
+                                tp_pct = (actual_entry - tp_actual) / actual_entry * 100
+                            rr_actual = round(tp_pct / sl_pct, 1) if sl_pct > 0 else 2.0
+                            
+                            trade_msg = f"""✅ <b>VÀO LỆNH THÀNH CÔNG</b> ({tier})
+📍 {symbol_ccxt} | {side_text}
+💰 Position: <b>{total_vol} USDT</b> (Leverage {GLOBAL_LEVERAGE}x)
+📊 Margin: {TRADE_AMOUNT_USDT} USDT | Qty: {sz}
+💰 Entry: {actual_entry:.6f}
+🔴 SL: {sl_actual:.6f} <b>(-{sl_pct:.3f}%)</b>
+🟢 TP1: {tp_actual:.6f} <b>(+{tp_pct:.3f}%)</b> → RR 1:{rr_actual}"""
+                            send_telegram_message(trade_msg)
+                            logging.info(f"AUTO-TRADE OPEN {side_text} {symbol} | Entry: {actual_entry:.6f} | SL: -{sl_pct:.3f}% | TP: +{tp_pct:.3f}%")
+                        else:
+                            err_msg = f"❌ <b>LỖI VÀO LỆNH</b>: {err if err else 'Fail'} | {side_text} {symbol_ccxt}"
+                            send_telegram_message(err_msg)
+                            logging.error(f"AUTO-TRADE ERROR {symbol}: {err}")
+                    elif TRADING_ENABLED and tier not in AUTO_TRADE_TIERS:
+                        print(f"ℹ️ {symbol}: Tier {tier} - chỉ thông báo, không auto-trade")
+                    
                     last_signal_ids[symbol] = signal_id
                     if last_signal_times is not None:
                         last_signal_times[f"{symbol}_{side}"] = datetime.now(TZ)
@@ -2187,6 +2537,17 @@ def main():
                     print(f"   ⏸️ HOLD: {', '.join(hold_symbols)}")
             
             first_run = False
+            
+            # ===== TRAILING SL & CLEANUP =====
+            if TRADING_ENABLED:
+                try:
+                    if TRAILING_ENABLED:
+                        manage_trailing_sl()
+                    cleanup_orphan_orders()
+                except Exception as e:
+                    print(f"⚠️ Lỗi trailing/cleanup: {e}")
+                    logging.error(f"Trailing/cleanup error: {e}")
+            
             time.sleep(LOOP_SLEEP_SECONDS)
             
         except KeyboardInterrupt:
@@ -2199,10 +2560,325 @@ def main():
             print(f"[CRITICAL ERROR] {e}")
             time.sleep(RETRY_DELAY)
 
+# ==============================================================================
+# ========== TELEGRAM COMMANDS ==========
+# ==============================================================================
+
+@tg_bot.message_handler(commands=['status'])
+def tg_status(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    try:
+        balance = exchange.fetch_balance()
+        usdt_free = float(balance['free'].get('USDT', 0))
+        usdt_total = float(balance['total'].get('USDT', 0))
+    except:
+        usdt_free = 0
+        usdt_total = 0
+    mode = "🧪 TESTNET" if USE_TESTNET else "🔴 LIVE"
+    msg = f"""✅ <b>Bot đang chạy</b> ({mode})
+📊 Pairs: {len(SYMBOLS)} | TF: {INTERVAL}
+⚡ Leverage: {GLOBAL_LEVERAGE}x
+💰 Margin/lệnh: {TRADE_AMOUNT_USDT} USDT → Position: {TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT
+💵 Số dư: {usdt_free:.2f} USDT (khả dụng) / {usdt_total:.2f} USDT (tổng)
+🤖 Auto Trade: {'🟢 ON' if TRADING_ENABLED else '🔴 OFF'}
+🛡️ Trailing SL: {'🟢 ON' if TRAILING_ENABLED else '🔴 OFF'}
+📋 Auto-Trade Tiers: {', '.join(AUTO_TRADE_TIERS)}
+📊 Max Positions: {MAX_POSITIONS}"""
+    tg_bot.reply_to(message, msg, parse_mode='HTML')
+
+@tg_bot.message_handler(commands=['trade'])
+def tg_trade_control(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    global TRADING_ENABLED
+    text = message.text.lower()
+    if 'on' in text:
+        TRADING_ENABLED = True
+        tg_bot.reply_to(message, "✅ AUTO TRADE BẬT")
+    elif 'off' in text:
+        TRADING_ENABLED = False
+        tg_bot.reply_to(message, "⛔ AUTO TRADE TẮT")
+    else:
+        tg_bot.reply_to(message, f"Trạng thái: {'🟢 ON' if TRADING_ENABLED else '🔴 OFF'}")
+
+@tg_bot.message_handler(commands=['amo'])
+def tg_set_amount(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    global TRADE_AMOUNT_USDT
+    parts = message.text.strip().split()
+    if len(parts) >= 2:
+        try:
+            new_val = float(parts[1])
+            if new_val <= 0:
+                tg_bot.reply_to(message, "❌ Giá trị phải > 0")
+                return
+            TRADE_AMOUNT_USDT = new_val
+            tg_bot.reply_to(message, f"✅ Đã set vốn = <b>{TRADE_AMOUNT_USDT} USDT</b>\nPosition Size = <b>{TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT</b> (Leverage {GLOBAL_LEVERAGE}x)", parse_mode='HTML')
+        except ValueError:
+            tg_bot.reply_to(message, "❌ Sai định dạng. VD: /amo 20")
+    else:
+        tg_bot.reply_to(message, f"💰 Vốn hiện tại: <b>{TRADE_AMOUNT_USDT} USDT</b>\nPosition Size: <b>{TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT</b>\n\nĐể thay đổi: /amo 20", parse_mode='HTML')
+
+@tg_bot.message_handler(commands=['leve'])
+def tg_set_leverage(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    global GLOBAL_LEVERAGE
+    parts = message.text.strip().split()
+    if len(parts) >= 2:
+        try:
+            new_val = int(parts[1])
+            if new_val < 1 or new_val > 125:
+                tg_bot.reply_to(message, "❌ Leverage phải từ 1 đến 125")
+                return
+            GLOBAL_LEVERAGE = new_val
+            for sym in CCXT_PAIRS:
+                try:
+                    exchange.set_leverage(GLOBAL_LEVERAGE, sym)
+                except:
+                    pass
+            tg_bot.reply_to(message, f"✅ Đã set leverage = <b>{GLOBAL_LEVERAGE}x</b>\nPosition Size = <b>{TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT</b>", parse_mode='HTML')
+        except ValueError:
+            tg_bot.reply_to(message, "❌ Sai định dạng. VD: /leve 10")
+    else:
+        tg_bot.reply_to(message, f"⚡ Leverage hiện tại: <b>{GLOBAL_LEVERAGE}x</b>\nPosition Size: <b>{TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT</b>\n\nĐể thay đổi: /leve 10", parse_mode='HTML')
+
+@tg_bot.message_handler(commands=['limit'])
+def tg_set_limit(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    global MAX_POSITIONS
+    parts = message.text.strip().split()
+    if len(parts) >= 2:
+        try:
+            new_val = int(parts[1])
+            if new_val < 1:
+                tg_bot.reply_to(message, "❌ Giá trị phải >= 1")
+                return
+            MAX_POSITIONS = new_val
+            tg_bot.reply_to(message, f"✅ Đã set giới hạn vị thế = <b>{MAX_POSITIONS}</b>", parse_mode='HTML')
+        except ValueError:
+            tg_bot.reply_to(message, "❌ Sai định dạng. VD: /limit 5")
+    else:
+        tg_bot.reply_to(message, f"📊 Giới hạn vị thế hiện tại: <b>{MAX_POSITIONS}</b>\n\nĐể thay đổi: /limit 5", parse_mode='HTML')
+
+@tg_bot.message_handler(commands=['pos'])
+def tg_show_positions(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    try:
+        positions = exchange.fetch_positions()
+        active = [p for p in positions if float(p.get('contracts', 0) or 0) != 0]
+
+        if not active:
+            tg_bot.reply_to(message, "📭 Hiện không có vị thế nào đang mở.")
+            return
+
+        total_pnl = sum(float(p.get('unrealizedPnl', 0) or 0) for p in active)
+        total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+
+        active.sort(key=lambda p: float(p.get('unrealizedPnl', 0) or 0), reverse=True)
+
+        msg = f"📊 <b>Có {len(active)} VỊ THẾ ĐANG MỞ</b> (Tổng PNL: {total_emoji} {total_pnl:+.4f} USDT)\n\n"
+
+        for p in active:
+            symbol = p.get('symbol', 'Unknown').replace(':USDT', '').replace('USDT', '')
+            pos_side = p.get('side', 'UNKNOWN').upper()
+            qty = float(p.get('contracts', 0) or 0)
+            entry = float(p.get('entryPrice', 0) or 0)
+            pnl = float(p.get('unrealizedPnl', 0) or 0)
+
+            notional = qty * entry
+            lev = p.get('leverage')
+            leverage = int(lev) if lev is not None else GLOBAL_LEVERAGE
+            margin = notional / leverage if leverage > 0 else 1
+            pnl_percent = (pnl / margin * 100) if margin > 0 else 0
+
+            ts = p.get('timestamp') or p.get('updateTime')
+            time_str = datetime.fromtimestamp(ts / 1000).strftime('%H:%M') if ts else "N/A"
+
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            pnl_str = f"{pnl_emoji} <b>{pnl:+.4f} USDT</b> ({pnl_percent:+.2f}%)"
+
+            msg += f"<code>{symbol}</code> | <b>{pos_side}</b> | USDT: {notional:.2f} | Entry: {entry:.6f} | {time_str} | PNL: {pnl_str}\n"
+
+        tg_bot.reply_to(message, msg, parse_mode='HTML')
+
+    except Exception as e:
+        tg_bot.reply_to(message, f"❌ Lỗi lấy positions: {e}")
+
+@tg_bot.message_handler(commands=['closed'])
+def tg_show_closed(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    try:
+        since = int((time.time() - 86400) * 1000)
+        all_trades = []
+
+        for sym in CCXT_PAIRS:
+            try:
+                trades = exchange.fetch_my_trades(sym, since=since, limit=100)
+                for t in trades:
+                    rpnl = float(t['info'].get('realizedPnl', 0) or 0)
+                    if rpnl != 0:
+                        all_trades.append(t)
+            except:
+                pass
+
+        if not all_trades:
+            tg_bot.reply_to(message, "📭 Không có lệnh nào đã đóng trong 24 giờ qua.")
+            return
+
+        all_trades.sort(key=lambda x: x['timestamp'], reverse=True)
+
+        msg = f"📜 <b>LỆNH ĐÃ ĐÓNG (24h qua)</b> - {len(all_trades)} lệnh\n\n"
+        for t in all_trades[:20]:
+            ts = datetime.fromtimestamp(t['timestamp'] / 1000).strftime('%H:%M')
+            t_symbol = t['symbol']
+            t_side = t['side'].upper()
+            qty = float(t['amount'])
+            price = float(t['price'])
+            pnl = float(t['info'].get('realizedPnl', 0) or 0)
+            fee = float(t.get('fee', {}).get('cost', 0) or 0)
+            msg += f"<code>{ts}</code> | {t_symbol} | <b>{t_side}</b> | {qty:.6f} @ {price:.6f} | PNL: <b>{pnl:+.4f}</b> USDT (phí {fee:.4f})\n"
+
+        tg_bot.reply_to(message, msg, parse_mode='HTML')
+    except Exception as e:
+        tg_bot.reply_to(message, f"❌ Lỗi lấy lịch sử lệnh: {e}")
+
+@tg_bot.message_handler(commands=['stats', 'thongke', 'daily'])
+def tg_stats(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    try:
+        since = int((time.time() - 86400) * 1000)
+        total_pnl = 0.0
+        num_closed = 0
+        wins = 0
+        total_volume = 0.0
+
+        for sym in CCXT_PAIRS:
+            try:
+                my_trades = exchange.fetch_my_trades(sym, since=since, limit=500)
+                for t in my_trades:
+                    rpnl = float(t['info'].get('realizedPnl', 0) or 0)
+                    total_pnl += rpnl
+                    qty = float(t.get('amount', 0))
+                    total_volume += qty * float(t.get('price', 0))
+                    if rpnl != 0:
+                        num_closed += 1
+                        if rpnl > 0:
+                            wins += 1
+            except:
+                pass
+
+        winrate = (wins / num_closed * 100) if num_closed > 0 else 0
+
+        msg = f"""📊 <b>THỐNG KÊ 24 GIỜ</b>
+Lệnh đã đóng: {num_closed}
+Winrate: {winrate:.1f}%
+PNL: {total_pnl:+.4f} USDT
+Volume: {total_volume:.2f} USDT"""
+        tg_bot.reply_to(message, msg, parse_mode='HTML')
+    except Exception as e:
+        tg_bot.reply_to(message, f"❌ Lỗi lấy thống kê: {e}")
+
+@tg_bot.message_handler(commands=['slmove'])
+def tg_slmove(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    global TRAILING_ENABLED
+    text = message.text.lower()
+    if 'on' in text:
+        TRAILING_ENABLED = True
+        tg_bot.reply_to(message, "✅ TRAILING SL đã BẬT\n🛡️ Bot sẽ tự động dời SL khi giá đạt RR1/RR2")
+    elif 'off' in text:
+        TRAILING_ENABLED = False
+        tg_bot.reply_to(message, "⛔ TRAILING SL đã TẮT\n⚠️ SL sẽ giữ nguyên vị trí ban đầu")
+    else:
+        status = '🟢 ON' if TRAILING_ENABLED else '🔴 OFF'
+        tg_bot.reply_to(message, f"""🛡️ <b>Trailing SL: {status}</b>
+
+Bước 1: Giá đạt RR1 → Dời SL về Entry (hòa vốn)
+Bước 2: Giá đạt RR2 → Dời SL về RR1 (khóa lời)
+
+Dùng: /slmove on hoặc /slmove off""", parse_mode='HTML')
+
+@tg_bot.message_handler(commands=['ip'])
+def tg_show_ip(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    try:
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+    except:
+        hostname = "N/A"
+        local_ip = "N/A"
+    try:
+        ext_ip = req_lib.get('https://api.ipify.org', timeout=5).text
+    except:
+        ext_ip = "N/A"
+    msg = f"""🌐 <b>Thông tin mạng</b>
+🖥️ Hostname: <code>{hostname}</code>
+🏠 Local IP: <code>{local_ip}</code>
+🌍 External IP: <code>{ext_ip}</code>"""
+    tg_bot.reply_to(message, msg, parse_mode='HTML')
+
+@tg_bot.message_handler(commands=['help'])
+def tg_help(message):
+    if message.chat.id == TG_CHAT_ID:
+        tg_bot.reply_to(message, """<b>BTC Trend 3m Bot - Danh sách lệnh</b>
+
+/status     - Trạng thái bot
+/trade on   - Bật tự động trade
+/trade off  - Tắt tự động trade
+/slmove on  - Bật trailing SL
+/slmove off - Tắt trailing SL
+/amo 20     - Set vốn (USDT)
+/leve 10    - Set leverage
+/limit 5    - Set giới hạn vị thế tối đa
+/pos        - Xem vị thế đang mở
+/closed     - Xem lệnh đã đóng + PNL 24h
+/stats      - Thống kê 24 giờ
+/ip         - Xem IP máy chủ bot
+/help       - Hiển thị hướng dẫn
+
+<b>Auto-Trade:</b> Chỉ vào lệnh với tín hiệu CAO CẤP và TIÊU CHUẨN
+Tín hiệu CƠ BẢN chỉ gửi thông báo.""", parse_mode='HTML')
+
+# ==============================================================================
+# ========== KHỞI ĐỘNG ==========
+# ==============================================================================
 if __name__ == "__main__":
     try:
-        print("\nStarting websocket...")
-        main()
+        # Send startup notification
+        startup_msg = f"""🤖 <b>BTC Trend 3m Bot (Auto-Trade)</b>
+Max Positions: {MAX_POSITIONS} | Leverage: {GLOBAL_LEVERAGE}x
+Position Size: {TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE} USDT
+SL Mode: ATR-based + Trailing SL
+Auto Trade: {'🟢 ON' if TRADING_ENABLED else '🔴 OFF'}
+Auto-Trade Tiers: {', '.join(AUTO_TRADE_TIERS)}
+Pairs: {len(SYMBOLS)} cặp
+Mode: {'🧪 TESTNET' if USE_TESTNET else '🔴 LIVE'}"""
+        send_telegram_message(startup_msg)
+        
+        print("\n🚀 BTC Trend 3m Bot (Auto-Trade) đang khởi động...")
+        
+        # Chạy main loop trong background thread
+        threading.Thread(target=main, daemon=True).start()
+        
+        # Telegram bot polling (main thread)
+        print("📱 Telegram commands đang hoạt động...")
+        try:
+            tg_bot.remove_webhook()
+            time.sleep(1)
+        except Exception as e:
+            print(f"Lỗi khi xóa webhook: {e}")
+            
+        tg_bot.polling(none_stop=True)
+        
     except KeyboardInterrupt:
         print("\nDetected Ctrl+C, shutting down gracefully...")
     except Exception as e:
