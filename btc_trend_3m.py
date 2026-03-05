@@ -2760,7 +2760,7 @@ def tg_show_positions(message):
             pnl_percent = (pnl / margin * 100) if margin > 0 else 0
 
             ts = p.get('timestamp') or p.get('updateTime')
-            time_str = datetime.fromtimestamp(ts / 1000).strftime('%H:%M') if ts else "N/A"
+            time_str = datetime.fromtimestamp(ts / 1000, tz=TZ).strftime('%H:%M') if ts else "N/A"
 
             pnl_emoji = "🟢" if pnl >= 0 else "🔴"
             pnl_str = f"{pnl_emoji} <b>{pnl:+.4f} USDT</b> ({pnl_percent:+.2f}%)"
@@ -2798,7 +2798,7 @@ def tg_show_closed(message):
 
         msg = f"📜 <b>LỆNH ĐÃ ĐÓNG (24h qua)</b> - {len(all_trades)} lệnh\n\n"
         for t in all_trades[:20]:
-            ts = datetime.fromtimestamp(t['timestamp'] / 1000).strftime('%H:%M')
+            ts = datetime.fromtimestamp(t['timestamp'] / 1000, tz=TZ).strftime('%H:%M')
             t_symbol = t['symbol']
             t_side = t['side'].upper()
             qty = float(t['amount'])
