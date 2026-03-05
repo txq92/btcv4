@@ -105,11 +105,11 @@ BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 
 TRADE_AMOUNT_USDT = 50.0        # Vốn mỗi lệnh (USDT)
 GLOBAL_LEVERAGE = 25            # Đòn bẩy
-MAX_POSITIONS = 3               # Số vị thế tối đa
+MAX_POSITIONS = 7               # Số vị thế tối đa
 TRADING_ENABLED = True          # Bật/tắt auto trade
 TRAILING_ENABLED = True         # Bật/tắt trailing SL
 USE_TESTNET = os.environ.get("TESTNET_MODE", "True").strip().lower() == "true"
-AUTO_TRADE_TIERS = ["PREMIUM", "STANDARD"]  # Chỉ tier này mới auto trade
+AUTO_TRADE_TIERS = ["PREMIUM", "STANDARD", "BASIC"]  # Tier được auto trade
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -1264,14 +1264,56 @@ def execute_trade(symbol_ccxt, side, entry_price, sl_price, tp1_price):
         order = exchange.create_market_order(symbol_ccxt, side, quantity)
         actual_entry = float(order.get('price') or exchange.fetch_ticker(symbol_ccxt)['last'])
 
-        # Đặt SL & TP
+        # ===== AUTO-ADJUST SL/TP: đảm bảo cách entry tối thiểu 0.3% =====
+        min_dist = actual_entry * 0.003  # 0.3% minimum distance
+        if side == 'buy':  # LONG
+            if sl >= actual_entry - min_dist:
+                sl = float(exchange.price_to_precision(symbol_ccxt, actual_entry - min_dist))
+                print(f"⚠️ Auto-adjust SL LONG {symbol_ccxt}: SL quá gần → {sl}")
+            if tp <= actual_entry + min_dist:
+                tp = float(exchange.price_to_precision(symbol_ccxt, actual_entry + min_dist))
+                print(f"⚠️ Auto-adjust TP LONG {symbol_ccxt}: TP quá gần → {tp}")
+        else:  # SHORT
+            if sl <= actual_entry + min_dist:
+                sl = float(exchange.price_to_precision(symbol_ccxt, actual_entry + min_dist))
+                print(f"⚠️ Auto-adjust SL SHORT {symbol_ccxt}: SL quá gần → {sl}")
+            if tp >= actual_entry - min_dist:
+                tp = float(exchange.price_to_precision(symbol_ccxt, actual_entry - min_dist))
+                print(f"⚠️ Auto-adjust TP SHORT {symbol_ccxt}: TP quá gần → {tp}")
+
+        # Đặt SL & TP với safety net
         sl_side = 'sell' if side == 'buy' else 'buy'
         tp_side = 'sell' if side == 'buy' else 'buy'
 
-        exchange.create_order(symbol_ccxt, 'stop_market', sl_side, quantity,
-                              params={'stopPrice': sl, 'reduceOnly': True})
-        exchange.create_order(symbol_ccxt, 'take_profit_market', tp_side, quantity,
-                              params={'stopPrice': tp, 'reduceOnly': True})
+        try:
+            exchange.create_order(symbol_ccxt, 'stop_market', sl_side, quantity,
+                                  params={'stopPrice': sl, 'reduceOnly': True})
+            exchange.create_order(symbol_ccxt, 'take_profit_market', tp_side, quantity,
+                                  params={'stopPrice': tp, 'reduceOnly': True})
+        except Exception as sl_tp_err:
+            # ===== SAFETY NET: SL/TP fail → đóng vị thế ngay lập tức =====
+            print(f"🚨 SL/TP FAIL {symbol_ccxt}: {sl_tp_err}")
+            logging.error(f"SL/TP FAIL {symbol_ccxt}: {sl_tp_err} | Đóng vị thế khẩn cấp")
+            try:
+                close_side = 'sell' if side == 'buy' else 'buy'
+                exchange.create_market_order(symbol_ccxt, close_side, quantity,
+                                             params={'reduceOnly': True})
+                emergency_msg = (f"🚨 <b>ĐÓNG KHẨN CẤP</b> {symbol_ccxt}\n"
+                                 f"📍 Lý do: SL/TP không đặt được\n"
+                                 f"❌ Lỗi: {sl_tp_err}\n"
+                                 f"💰 Entry: {actual_entry:.6f} | SL tính: {sl} | TP tính: {tp}\n"
+                                 f"🔄 Đã đóng vị thế để bảo vệ vốn")
+                send_telegram_message(emergency_msg)
+                logging.info(f"EMERGENCY CLOSE {symbol_ccxt} - SL/TP failed")
+            except Exception as close_err:
+                close_fail_msg = (f"🚨🚨 <b>NGUY HIỂM - KHÔNG ĐÓNG ĐƯỢC</b> {symbol_ccxt}\n"
+                                  f"📍 SL/TP fail: {sl_tp_err}\n"
+                                  f"📍 Đóng lệnh fail: {close_err}\n"
+                                  f"⚠️ VỊ THẾ ĐANG MỞ KHÔNG CÓ SL/TP!\n"
+                                  f"👉 Hãy đóng thủ công ngay!")
+                send_telegram_message(close_fail_msg)
+                logging.critical(f"CANNOT CLOSE {symbol_ccxt}: {close_err}")
+            return None, "0", 0, 0, f"SL/TP fail, đã đóng khẩn cấp: {sl_tp_err}"
 
         # Tính % SL & % TP
         if side == 'buy':
@@ -1480,17 +1522,25 @@ def compute_sl_tp(dfp: pd.DataFrame, side: str, symbol: str = "BTCUSDT") -> dict
         strategy_used = "Enhanced_Swing_ATR"
         confidence = 0.7
         
+        # Minimum distance = atr_sl_mult × ATR (đảm bảo SL không quá gần entry)
+        min_sl_distance = current_atr * config["atr_sl_mult"]
+        
         if side == "bullish":
-            # Enhanced SL calculation with ATR buffer
+            # Enhanced SL calculation with ATR buffer from config
             if l_idx:
                 swing_low = float(dfp.loc[l_idx[-1], "low"])
-                atr_buffer = current_atr * 1.0   # tối thiểu 1×ATR
-                sl = swing_low - atr_buffer  # FIX: gán SL cho LONG
+                atr_buffer = current_atr * config["atr_sl_mult"]
+                sl = swing_low - atr_buffer
             else:
                 # Fallback to ATR-based SL
                 sl = entry - (current_atr * config["atr_sl_mult"])
                 strategy_used = "ATR_Based"
                 confidence = 0.6
+            
+            # Safety: đảm bảo SL luôn DƯỚI entry với khoảng cách tối thiểu
+            if sl >= entry - min_sl_distance:
+                sl = entry - min_sl_distance
+                strategy_used = "ATR_SafetyAdjusted"
             
             # Enhanced TP calculation - multiple levels
             if h_idx:
@@ -1511,17 +1561,26 @@ def compute_sl_tp(dfp: pd.DataFrame, side: str, symbol: str = "BTCUSDT") -> dict
                 tp2 = entry + (current_atr * config["atr_tp_mult"] * 1.2)
                 tp3 = entry + (current_atr * config["atr_tp_mult"] * 1.5)
                 strategy_used = "ATR_Based"
+            
+            # Safety: đảm bảo TP1 luôn TRÊN entry
+            if tp1 is not None and tp1 <= entry:
+                tp1 = entry + (current_atr * config["atr_tp_mult"])
         
         else:  # bearish
-            # Enhanced SL calculation with ATR buffer
+            # Enhanced SL calculation with ATR buffer from config
             if h_idx:
                 swing_high = float(dfp.loc[h_idx[-1], "high"])
-                atr_buffer = current_atr * 0.5
+                atr_buffer = current_atr * config["atr_sl_mult"]
                 sl = swing_high + atr_buffer
             else:
                 sl = entry + (current_atr * config["atr_sl_mult"])
                 strategy_used = "ATR_Based"
                 confidence = 0.6
+            
+            # Safety: đảm bảo SL luôn TRÊN entry với khoảng cách tối thiểu
+            if sl <= entry + min_sl_distance:
+                sl = entry + min_sl_distance
+                strategy_used = "ATR_SafetyAdjusted"
             
             # Enhanced TP calculation - multiple levels
             if l_idx:
@@ -1540,6 +1599,10 @@ def compute_sl_tp(dfp: pd.DataFrame, side: str, symbol: str = "BTCUSDT") -> dict
                 tp2 = entry - (current_atr * config["atr_tp_mult"] * 1.2)
                 tp3 = entry - (current_atr * config["atr_tp_mult"] * 1.5)
                 strategy_used = "ATR_Based"
+            
+            # Safety: đảm bảo TP1 luôn DƯỚI entry
+            if tp1 is not None and tp1 >= entry:
+                tp1 = entry - (current_atr * config["atr_tp_mult"])
         
         # Calculate R:R ratio
         rr = None
@@ -2806,6 +2869,27 @@ Bước 2: Giá đạt RR2 → Dời SL về RR1 (khóa lời)
 
 Dùng: /slmove on hoặc /slmove off""", parse_mode='HTML')
 
+@tg_bot.message_handler(commands=['basic'])
+def tg_basic_control(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    global AUTO_TRADE_TIERS
+    text = message.text.lower()
+    if 'on' in text:
+        if 'BASIC' not in AUTO_TRADE_TIERS:
+            AUTO_TRADE_TIERS.append('BASIC')
+        tg_bot.reply_to(message, "✅ Auto-Trade BASIC đã <b>BẬT</b>\n⚠️ Tín hiệu CƠ BẢN sẽ tự động vào lệnh", parse_mode='HTML')
+    elif 'off' in text:
+        AUTO_TRADE_TIERS = [t for t in AUTO_TRADE_TIERS if t != 'BASIC']
+        tg_bot.reply_to(message, "⛔ Auto-Trade BASIC đã <b>TẮT</b>\n📱 Tín hiệu CƠ BẢN chỉ gửi thông báo", parse_mode='HTML')
+    else:
+        status = '🟢 ON' if 'BASIC' in AUTO_TRADE_TIERS else '🔴 OFF'
+        tg_bot.reply_to(message, f"""⚠️ <b>Auto-Trade BASIC: {status}</b>
+
+Tiers đang trade: {', '.join(AUTO_TRADE_TIERS)}
+
+Dùng: /basic on hoặc /basic off""", parse_mode='HTML')
+
 @tg_bot.message_handler(commands=['ip'])
 def tg_show_ip(message):
     if message.chat.id != TG_CHAT_ID:
@@ -2834,6 +2918,8 @@ def tg_help(message):
 /status     - Trạng thái bot
 /trade on   - Bật tự động trade
 /trade off  - Tắt tự động trade
+/basic on   - Bật auto-trade BASIC
+/basic off  - Tắt auto-trade BASIC
 /slmove on  - Bật trailing SL
 /slmove off - Tắt trailing SL
 /amo 20     - Set vốn (USDT)
@@ -2845,8 +2931,8 @@ def tg_help(message):
 /ip         - Xem IP máy chủ bot
 /help       - Hiển thị hướng dẫn
 
-<b>Auto-Trade:</b> Chỉ vào lệnh với tín hiệu CAO CẤP và TIÊU CHUẨN
-Tín hiệu CƠ BẢN chỉ gửi thông báo.""", parse_mode='HTML')
+<b>Auto-Trade:</b> Vào lệnh với tín hiệu CAO CẤP, TIÊU CHUẨN và CƠ BẢN
+Dùng /basic off để chỉ trade CAO CẤP + TIÊU CHUẨN.""", parse_mode='HTML')
 
 # ==============================================================================
 # ========== KHỞI ĐỘNG ==========
