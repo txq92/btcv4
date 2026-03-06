@@ -60,10 +60,15 @@ SYMBOLS = [
     "AAVEUSDT",
     "LTCUSDT",
     "ONDOUSDT",
-    "TAOUSDT"
+    "TAOUSDT",
+    "DOTUSDT",
+    "LINKUSDT",
+    "AVAXUSDT",
+    "NEARUSDT",
+    "APTUSDT"
 ]
-INTERVAL = "3m"
-LIMIT = 120
+INTERVAL = "5m"
+LIMIT = 100  # Rút gọn số lượng nến từ 120 xuống 100 để load nhanh hơn (100 nến 5m = 500 phút = ~8 tiếng dữ liệu là đủ phân tích)
 
 # API Configs
 BASE = "https://api.binance.com"
@@ -81,6 +86,11 @@ SEND_MARKET_DIRECTION = False    # Enable/Disable Market Direction alerts
 
 # Enhanced R:R Configuration
 SYMBOL_SPECIFIC_RR = {
+    "DOTUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
+    "LINKUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
+    "AVAXUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
+    "NEARUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
+    "APTUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
     "BTCUSDT": {"min_rr": 1.2, "risk_percent": 1.0, "atr_sl_mult": 1.2, "atr_tp_mult": 2.5},
     "ETHUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
     "SUIUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 1.8, "atr_tp_mult": 3.5},
@@ -94,6 +104,7 @@ SYMBOL_SPECIFIC_RR = {
     "LTCUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
     "ONDOUSDT": {"min_rr": 2.0, "risk_percent": 0.5, "atr_sl_mult": 2.0, "atr_tp_mult": 4.0},
     "TAOUSDT": {"min_rr": 2.0, "risk_percent": 0.5, "atr_sl_mult": 2.0, "atr_tp_mult": 4.0}
+
 }
 
 VOLUME_THRESHOLD = 1.2          # Volume ratio for confidence boost
@@ -103,13 +114,13 @@ VOLATILITY_THRESHOLD = 2.0      # High volatility threshold
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 
-TRADE_AMOUNT_USDT = 50.0        # Vốn mỗi lệnh (USDT)
-GLOBAL_LEVERAGE = 25            # Đòn bẩy
-MAX_POSITIONS = 7               # Số vị thế tối đa
+TRADE_AMOUNT_USDT = 10.0        # Vốn mỗi lệnh (USDT)
+GLOBAL_LEVERAGE = 25           # Đòn bẩy
+MAX_POSITIONS = 3             # Số vị thế tối đa
 TRADING_ENABLED = True          # Bật/tắt auto trade
 TRAILING_ENABLED = True         # Bật/tắt trailing SL
 USE_TESTNET = os.environ.get("TESTNET_MODE", "True").strip().lower() == "true"
-AUTO_TRADE_TIERS = ["PREMIUM", "STANDARD", "BASIC"]  # Tier được auto trade
+AUTO_TRADE_TIERS = ["PREMIUM", "STANDARD"]  # Tier được auto trade
 
 # ================= LOGGING =================
 logging.basicConfig(
