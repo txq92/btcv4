@@ -115,12 +115,12 @@ BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 
 TRADE_AMOUNT_USDT = 10.0        # Vốn mỗi lệnh (USDT)
-GLOBAL_LEVERAGE = 25           # Đòn bẩy
-MAX_POSITIONS = 3             # Số vị thế tối đa
+GLOBAL_LEVERAGE = 25            # Đòn bẩy
+MAX_POSITIONS = 3               # Số vị thế tối đa
 TRADING_ENABLED = True          # Bật/tắt auto trade
 TRAILING_ENABLED = True         # Bật/tắt trailing SL
 USE_TESTNET = os.environ.get("TESTNET_MODE", "True").strip().lower() == "true"
-AUTO_TRADE_TIERS = ["PREMIUM", "STANDARD"]  # Tier được auto trade
+AUTO_TRADE_TIERS = ["PREMIUM"]  # Tier được auto trade mặc định
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -1271,26 +1271,26 @@ def execute_trade(symbol_ccxt, side, entry_price, sl_price, tp1_price):
         sl = float(exchange.price_to_precision(symbol_ccxt, sl_price))
         tp = float(exchange.price_to_precision(symbol_ccxt, tp1_price))
 
+        # ===== AUTO-ADJUST SL/TP: đảm bảo cách entry tối thiểu 0.3% =====
+        min_dist = entry_price * 0.003  # 0.3% minimum distance
+        if side == 'buy':  # LONG
+            if sl >= entry_price - min_dist:
+                sl = float(exchange.price_to_precision(symbol_ccxt, entry_price - min_dist))
+                print(f"⚠️ Auto-adjust SL LONG {symbol_ccxt}: SL quá gần → {sl}")
+            if tp <= entry_price + min_dist:
+                tp = float(exchange.price_to_precision(symbol_ccxt, entry_price + min_dist))
+                print(f"⚠️ Auto-adjust TP LONG {symbol_ccxt}: TP quá gần → {tp}")
+        else:  # SHORT
+            if sl <= entry_price + min_dist:
+                sl = float(exchange.price_to_precision(symbol_ccxt, entry_price + min_dist))
+                print(f"⚠️ Auto-adjust SL SHORT {symbol_ccxt}: SL quá gần → {sl}")
+            if tp >= entry_price - min_dist:
+                tp = float(exchange.price_to_precision(symbol_ccxt, entry_price - min_dist))
+                print(f"⚠️ Auto-adjust TP SHORT {symbol_ccxt}: TP quá gần → {tp}")
+
         # Đặt lệnh Market
         order = exchange.create_market_order(symbol_ccxt, side, quantity)
         actual_entry = float(order.get('price') or exchange.fetch_ticker(symbol_ccxt)['last'])
-
-        # ===== AUTO-ADJUST SL/TP: đảm bảo cách entry tối thiểu 0.3% =====
-        min_dist = actual_entry * 0.003  # 0.3% minimum distance
-        if side == 'buy':  # LONG
-            if sl >= actual_entry - min_dist:
-                sl = float(exchange.price_to_precision(symbol_ccxt, actual_entry - min_dist))
-                print(f"⚠️ Auto-adjust SL LONG {symbol_ccxt}: SL quá gần → {sl}")
-            if tp <= actual_entry + min_dist:
-                tp = float(exchange.price_to_precision(symbol_ccxt, actual_entry + min_dist))
-                print(f"⚠️ Auto-adjust TP LONG {symbol_ccxt}: TP quá gần → {tp}")
-        else:  # SHORT
-            if sl <= actual_entry + min_dist:
-                sl = float(exchange.price_to_precision(symbol_ccxt, actual_entry + min_dist))
-                print(f"⚠️ Auto-adjust SL SHORT {symbol_ccxt}: SL quá gần → {sl}")
-            if tp >= actual_entry - min_dist:
-                tp = float(exchange.price_to_precision(symbol_ccxt, actual_entry - min_dist))
-                print(f"⚠️ Auto-adjust TP SHORT {symbol_ccxt}: TP quá gần → {tp}")
 
         # Đặt SL & TP với safety net
         sl_side = 'sell' if side == 'buy' else 'buy'
@@ -2419,7 +2419,7 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict, last_sig
                         send_telegram_photo(save_paths["price_3m"], f"{symbol} Price 3m")
                         send_telegram_photo(save_paths["price_15m"], f"{symbol} Price 15m")
                     
-                    # ===== AUTO-TRADE: Vào lệnh tự động cho PREMIUM & STANDARD =====
+                    # ===== AUTO-TRADE: Vào lệnh tự động cho PREMIUM, STANDARD, BASIC =====
                     if TRADING_ENABLED and tier in AUTO_TRADE_TIERS:
                         trade_side = 'buy' if side == 'bullish' else 'sell'
                         symbol_ccxt = symbol.replace('USDT', '/USDT')
@@ -2456,8 +2456,6 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict, last_sig
                             err_msg = f"❌ <b>LỖI VÀO LỆNH</b>: {err if err else 'Fail'} | {side_text} {symbol_ccxt}"
                             send_telegram_message(err_msg)
                             logging.error(f"AUTO-TRADE ERROR {symbol}: {err}")
-                    elif TRADING_ENABLED and tier not in AUTO_TRADE_TIERS:
-                        print(f"ℹ️ {symbol}: Tier {tier} - chỉ thông báo, không auto-trade")
                     
                     last_signal_ids[symbol] = signal_id
                     if last_signal_times is not None:
@@ -2657,7 +2655,7 @@ def tg_status(message):
 💵 Số dư: {usdt_free:.2f} USDT (khả dụng) / {usdt_total:.2f} USDT (tổng)
 🤖 Auto Trade: {'🟢 ON' if TRADING_ENABLED else '🔴 OFF'}
 🛡️ Trailing SL: {'🟢 ON' if TRAILING_ENABLED else '🔴 OFF'}
-📋 Auto-Trade Tiers: {', '.join(AUTO_TRADE_TIERS)}
+📋 Tự động vào lệnh (Tiers): {', '.join(AUTO_TRADE_TIERS)}
 📊 Max Positions: {MAX_POSITIONS}"""
     tg_bot.reply_to(message, msg, parse_mode='HTML')
 
@@ -2776,46 +2774,6 @@ def tg_show_positions(message):
             pnl_emoji = "🟢" if pnl >= 0 else "🔴"
             pnl_str = f"{pnl_emoji} <b>{pnl:+.4f} USDT</b> ({pnl_percent:+.2f}%)"
 
-            msg += f"<code>{symbol}</code> | <b>{pos_side}</b> | USDT: {notional:.2f} | Entry: {entry:.6f} | {time_str} | PNL: {pnl_str}\n"
-
-        tg_bot.reply_to(message, msg, parse_mode='HTML')
-
-    except Exception as e:
-        tg_bot.reply_to(message, f"❌ Lỗi lấy positions: {e}")
-
-@tg_bot.message_handler(commands=['closed'])
-def tg_show_closed(message):
-    if message.chat.id != TG_CHAT_ID:
-        return
-    try:
-        since = int((time.time() - 86400) * 1000)
-        all_trades = []
-
-        for sym in CCXT_PAIRS:
-            try:
-                trades = exchange.fetch_my_trades(sym, since=since, limit=100)
-                for t in trades:
-                    rpnl = float(t['info'].get('realizedPnl', 0) or 0)
-                    if rpnl != 0:
-                        all_trades.append(t)
-            except:
-                pass
-
-        if not all_trades:
-            tg_bot.reply_to(message, "📭 Không có lệnh nào đã đóng trong 24 giờ qua.")
-            return
-
-        all_trades.sort(key=lambda x: x['timestamp'], reverse=True)
-
-        msg = f"📜 <b>LỆNH ĐÃ ĐÓNG (24h qua)</b> - {len(all_trades)} lệnh\n\n"
-        for t in all_trades[:20]:
-            ts = datetime.fromtimestamp(t['timestamp'] / 1000, tz=TZ).strftime('%H:%M')
-            t_symbol = t['symbol']
-            t_side = t['side'].upper()
-            qty = float(t['amount'])
-            price = float(t['price'])
-            pnl = float(t['info'].get('realizedPnl', 0) or 0)
-            fee = float(t.get('fee', {}).get('cost', 0) or 0)
             msg += f"<code>{ts}</code> | {t_symbol} | <b>{t_side}</b> | {qty:.6f} @ {price:.6f} | PNL: <b>{pnl:+.4f}</b> USDT (phí {fee:.4f})\n"
 
         tg_bot.reply_to(message, msg, parse_mode='HTML')
@@ -2858,6 +2816,27 @@ Volume: {total_volume:.2f} USDT"""
         tg_bot.reply_to(message, msg, parse_mode='HTML')
     except Exception as e:
         tg_bot.reply_to(message, f"❌ Lỗi lấy thống kê: {e}")
+
+@tg_bot.message_handler(commands=['standard'])
+def tg_standard_control(message):
+    if message.chat.id != TG_CHAT_ID:
+        return
+    global AUTO_TRADE_TIERS
+    text = message.text.lower()
+    if 'on' in text:
+        if 'STANDARD' not in AUTO_TRADE_TIERS:
+            AUTO_TRADE_TIERS.append('STANDARD')
+        tg_bot.reply_to(message, "✅ Auto-Trade STANDARD đã <b>BẬT</b>\n⚠️ Tín hiệu TIÊU CHUẨN sẽ tự động vào lệnh", parse_mode='HTML')
+    elif 'off' in text:
+        AUTO_TRADE_TIERS = [t for t in AUTO_TRADE_TIERS if t != 'STANDARD']
+        tg_bot.reply_to(message, "⛔ Auto-Trade STANDARD đã <b>TẮT</b>\n📱 Tín hiệu TIÊU CHUẨN chỉ gửi thông báo", parse_mode='HTML')
+    else:
+        status = '🟢 ON' if 'STANDARD' in AUTO_TRADE_TIERS else '🔴 OFF'
+        tg_bot.reply_to(message, f"""⚠️ <b>Auto-Trade STANDARD: {status}</b>
+
+Tiers đang trade: {', '.join(AUTO_TRADE_TIERS)}
+
+Dùng: /standard on hoặc /standard off""", parse_mode='HTML')
 
 @tg_bot.message_handler(commands=['slmove'])
 def tg_slmove(message):
@@ -2929,8 +2908,10 @@ def tg_help(message):
 /status     - Trạng thái bot
 /trade on   - Bật tự động trade
 /trade off  - Tắt tự động trade
-/basic on   - Bật auto-trade BASIC
-/basic off  - Tắt auto-trade BASIC
+/standard on - Bật auto-trade tín hiệu STANDARD
+/standard off - Tắt auto-trade tín hiệu STANDARD
+/basic on   - Bật auto-trade tín hiệu BASIC
+/basic off  - Tắt auto-trade tín hiệu BASIC
 /slmove on  - Bật trailing SL
 /slmove off - Tắt trailing SL
 /amo 20     - Set vốn (USDT)
@@ -2942,8 +2923,8 @@ def tg_help(message):
 /ip         - Xem IP máy chủ bot
 /help       - Hiển thị hướng dẫn
 
-<b>Auto-Trade:</b> Vào lệnh với tín hiệu CAO CẤP, TIÊU CHUẨN và CƠ BẢN
-Dùng /basic off để chỉ trade CAO CẤP + TIÊU CHUẨN.""", parse_mode='HTML')
+<b>Mặc định:</b> Chỉ auto-trade cho tín hiệu CAO CẤP.
+Dùng /standard on hoặc /basic on để bật vào lệnh Tự động cho các tín hiệu khác.""", parse_mode='HTML')
 
 # ==============================================================================
 # ========== KHỞI ĐỘNG ==========
