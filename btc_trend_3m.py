@@ -2362,10 +2362,10 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict, last_sig
                         bias_score=recommendation['bias_score']
                     )
                     
-                    # If tier is None, signal doesn't meet minimum criteria
-                    if tier is None:
-                        print(f"❌ {symbol}: Signal score too low ({signal_score}/100)")
-                        return True, f"Low score: {signal_score}/100", recommendation
+                    # If tier is None or BASIC, signal doesn't meet criteria → bỏ qua
+                    if tier is None or tier == "BASIC":
+                        print(f"❌ {symbol}: Signal {tier or 'NONE'} bị bỏ qua (Score={signal_score}/100)")
+                        return True, f"Filtered: {tier or 'NONE'} ({signal_score}/100)", recommendation
                     
                     # Get position size recommendation based on tier
                     tier_config = {
