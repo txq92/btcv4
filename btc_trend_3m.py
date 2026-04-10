@@ -49,23 +49,14 @@ if not TELEGRAM_CHAT_ID:
 # ============== CONFIG ==============
 SYMBOLS = [
     "BTCUSDT",
-    "ETHUSDT", 
     "SUIUSDT",
     "SOLUSDT",
     "WLDUSDT",
-    "ADAUSDT",
-    "ENAUSDT",
-    "TRUMPUSDT",
-    "TONUSDT",
-    "AAVEUSDT",
     "LTCUSDT",
     "ONDOUSDT",
-    "TAOUSDT",
     "DOTUSDT",
-    "LINKUSDT",
     "AVAXUSDT",
-    "NEARUSDT",
-    "APTUSDT"
+    "XAUUSDT"
 ]
 INTERVAL = "5m"
 LIMIT = 100  # Rút gọn số lượng nến từ 120 xuống 100 để load nhanh hơn (100 nến 5m = 500 phút = ~8 tiếng dữ liệu là đủ phân tích)
@@ -86,25 +77,15 @@ SEND_MARKET_DIRECTION = False    # Enable/Disable Market Direction alerts
 
 # Enhanced R:R Configuration
 SYMBOL_SPECIFIC_RR = {
-    "DOTUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
-    "LINKUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
-    "AVAXUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
-    "NEARUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
-    "APTUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
     "BTCUSDT": {"min_rr": 1.2, "risk_percent": 1.0, "atr_sl_mult": 1.2, "atr_tp_mult": 2.5},
-    "ETHUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
     "SUIUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 1.8, "atr_tp_mult": 3.5},
     "SOLUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 1.8, "atr_tp_mult": 3.5},
     "WLDUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 1.8, "atr_tp_mult": 3.5},
-    "ADAUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
-    "ENAUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 1.8, "atr_tp_mult": 3.5},
-    "TRUMPUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 2.0, "atr_tp_mult": 4.0},
-    "TONUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 1.8, "atr_tp_mult": 3.5},
-    "AAVEUSDT": {"min_rr": 1.8, "risk_percent": 0.5, "atr_sl_mult": 1.8, "atr_tp_mult": 3.5},
     "LTCUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
     "ONDOUSDT": {"min_rr": 2.0, "risk_percent": 0.5, "atr_sl_mult": 2.0, "atr_tp_mult": 4.0},
-    "TAOUSDT": {"min_rr": 2.0, "risk_percent": 0.5, "atr_sl_mult": 2.0, "atr_tp_mult": 4.0}
-
+    "DOTUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
+    "AVAXUSDT": {"min_rr": 1.5, "risk_percent": 0.8, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0},
+    "XAUUSDT": {"min_rr": 1.2, "risk_percent": 1.0, "atr_sl_mult": 1.2, "atr_tp_mult": 2.5}
 }
 
 VOLUME_THRESHOLD = 1.2          # Volume ratio for confidence boost
@@ -1232,7 +1213,12 @@ def send_telegram_photo(photo_path: str, caption: str = "", max_retries: int = 3
 
 def execute_trade(symbol_ccxt, side, entry_price, sl_price, tp1_price):
     """
-    Đặt lệnh Market + SL + TP1 trên Binance Futures.
+    Đặt lệnh Limit (maker fee) + SL (stop_market) + TP (take_profit limit) trên Binance Futures.
+    
+    Tối ưu phí giao dịch:
+    - Entry: Limit order tại best bid/ask → maker fee (0.02% thay vì 0.05% taker)
+    - TP: take_profit limit → khi trigger sẽ đặt limit order → maker fee
+    - SL: stop_market → giữ market để đảm bảo cắt lỗ nhanh (an toàn)
     
     Args:
         symbol_ccxt: Cặp giao dịch dạng ccxt, ví dụ 'BTC/USDT'
@@ -1244,6 +1230,9 @@ def execute_trade(symbol_ccxt, side, entry_price, sl_price, tp1_price):
     Returns:
         Tuple (order, quantity_str, actual_sl, actual_tp, error_msg)
     """
+    LIMIT_ORDER_TIMEOUT = 30      # Thời gian chờ khớp limit (giây)
+    LIMIT_ORDER_CHECK_INTERVAL = 3  # Kiểm tra mỗi N giây
+
     try:
         # Kiểm tra vị thế hiện có
         positions = exchange.fetch_positions([symbol_ccxt])
@@ -1263,43 +1252,123 @@ def execute_trade(symbol_ccxt, side, entry_price, sl_price, tp1_price):
         if usdt_free < TRADE_AMOUNT_USDT:
             return None, "0", 0, 0, f"Số dư không đủ ({usdt_free:.2f} USDT)"
 
-        # Tính Volume
+        # ===== LẤY GIÁ BID/ASK TỐT NHẤT ĐỂ ĐẶT LIMIT =====
+        order_book = exchange.fetch_order_book(symbol_ccxt, limit=5)
+        best_bid = order_book['bids'][0][0] if order_book['bids'] else entry_price
+        best_ask = order_book['asks'][0][0] if order_book['asks'] else entry_price
+
+        # Chọn giá limit: đặt sát best bid/ask để tăng xác suất khớp nhanh
+        if side == 'buy':
+            # LONG: đặt tại best bid (hoặc cao hơn 1 tick để ưu tiên khớp)
+            limit_price = best_bid
+        else:
+            # SHORT: đặt tại best ask (hoặc thấp hơn 1 tick)
+            limit_price = best_ask
+
+        limit_price = float(exchange.price_to_precision(symbol_ccxt, limit_price))
+        print(f"📊 Orderbook {symbol_ccxt}: Bid={best_bid} | Ask={best_ask} | Limit={limit_price} ({side})")
+
+        # Tính Volume dựa trên limit_price
         total_notional_usdt = TRADE_AMOUNT_USDT * GLOBAL_LEVERAGE
-        quantity = float(exchange.amount_to_precision(symbol_ccxt, total_notional_usdt / entry_price))
+        quantity = float(exchange.amount_to_precision(symbol_ccxt, total_notional_usdt / limit_price))
 
         # Precision cho SL/TP
         sl = float(exchange.price_to_precision(symbol_ccxt, sl_price))
         tp = float(exchange.price_to_precision(symbol_ccxt, tp1_price))
 
         # ===== AUTO-ADJUST SL/TP: đảm bảo cách entry tối thiểu 0.3% =====
-        min_dist = entry_price * 0.003  # 0.3% minimum distance
+        min_dist = limit_price * 0.003  # 0.3% minimum distance
         if side == 'buy':  # LONG
-            if sl >= entry_price - min_dist:
-                sl = float(exchange.price_to_precision(symbol_ccxt, entry_price - min_dist))
+            if sl >= limit_price - min_dist:
+                sl = float(exchange.price_to_precision(symbol_ccxt, limit_price - min_dist))
                 print(f"⚠️ Auto-adjust SL LONG {symbol_ccxt}: SL quá gần → {sl}")
-            if tp <= entry_price + min_dist:
-                tp = float(exchange.price_to_precision(symbol_ccxt, entry_price + min_dist))
+            if tp <= limit_price + min_dist:
+                tp = float(exchange.price_to_precision(symbol_ccxt, limit_price + min_dist))
                 print(f"⚠️ Auto-adjust TP LONG {symbol_ccxt}: TP quá gần → {tp}")
         else:  # SHORT
-            if sl <= entry_price + min_dist:
-                sl = float(exchange.price_to_precision(symbol_ccxt, entry_price + min_dist))
+            if sl <= limit_price + min_dist:
+                sl = float(exchange.price_to_precision(symbol_ccxt, limit_price + min_dist))
                 print(f"⚠️ Auto-adjust SL SHORT {symbol_ccxt}: SL quá gần → {sl}")
-            if tp >= entry_price - min_dist:
-                tp = float(exchange.price_to_precision(symbol_ccxt, entry_price - min_dist))
+            if tp >= limit_price - min_dist:
+                tp = float(exchange.price_to_precision(symbol_ccxt, limit_price - min_dist))
                 print(f"⚠️ Auto-adjust TP SHORT {symbol_ccxt}: TP quá gần → {tp}")
 
-        # Đặt lệnh Market
-        order = exchange.create_market_order(symbol_ccxt, side, quantity)
-        actual_entry = float(order.get('price') or exchange.fetch_ticker(symbol_ccxt)['last'])
+        # ===== ĐẶT LỆNH LIMIT (MAKER FEE 0.02%) =====
+        order = exchange.create_limit_order(symbol_ccxt, side, quantity, limit_price)
+        order_id = order.get('id')
+        print(f"📋 Limit order đặt: {side.upper()} {quantity} {symbol_ccxt} @ {limit_price} (ID: {order_id})")
+
+        # ===== CHỜ KHỚP LỆNH LIMIT =====
+        actual_entry = None
+        filled_qty = 0
+        elapsed = 0
+
+        while elapsed < LIMIT_ORDER_TIMEOUT:
+            time.sleep(LIMIT_ORDER_CHECK_INTERVAL)
+            elapsed += LIMIT_ORDER_CHECK_INTERVAL
+
+            try:
+                order_status = exchange.fetch_order(order_id, symbol_ccxt)
+                status = order_status.get('status', '')
+                filled_qty = float(order_status.get('filled', 0) or 0)
+
+                if status == 'closed':
+                    # Đã khớp hoàn toàn
+                    actual_entry = float(order_status.get('average', 0) or limit_price)
+                    print(f"✅ Limit order KHỚP: {symbol_ccxt} @ {actual_entry} ({elapsed}s)")
+                    break
+                elif status == 'canceled' or status == 'cancelled':
+                    return None, "0", 0, 0, f"Limit order bị hủy bởi hệ thống"
+                else:
+                    print(f"⏳ Chờ khớp {symbol_ccxt}... {elapsed}/{LIMIT_ORDER_TIMEOUT}s (filled: {filled_qty})")
+            except Exception as check_err:
+                print(f"⚠️ Kiểm tra order lỗi: {check_err}")
+
+        # ===== NẾU CHƯA KHỚP SAU TIMEOUT → HỦY VÀ CHUYỂN SANG MARKET =====
+        if actual_entry is None:
+            try:
+                exchange.cancel_order(order_id, symbol_ccxt)
+                print(f"⏰ Timeout {LIMIT_ORDER_TIMEOUT}s → Hủy limit order {symbol_ccxt}")
+            except Exception as cancel_err:
+                # Có thể đã khớp ngay lúc cancel
+                try:
+                    order_status = exchange.fetch_order(order_id, symbol_ccxt)
+                    if order_status.get('status') == 'closed':
+                        actual_entry = float(order_status.get('average', 0) or limit_price)
+                        filled_qty = float(order_status.get('filled', 0) or 0)
+                        print(f"✅ Limit order KHỚP ngay lúc cancel: {symbol_ccxt} @ {actual_entry}")
+                except:
+                    pass
+
+            if actual_entry is None:
+                # Nếu khớp 1 phần → xử lý
+                if filled_qty > 0:
+                    quantity = filled_qty
+                    # Lấy average price thực tế từ order, fallback limit_price
+                    try:
+                        order_status = exchange.fetch_order(order_id, symbol_ccxt)
+                        actual_entry = float(order_status.get('average', 0) or limit_price)
+                    except:
+                        actual_entry = limit_price
+                    print(f"⚡ Khớp 1 phần {symbol_ccxt}: {filled_qty} @ {actual_entry}")
+                else:
+                    # Fallback: Đặt market order
+                    print(f"🔄 Fallback market order {symbol_ccxt}...")
+                    order = exchange.create_market_order(symbol_ccxt, side, quantity)
+                    actual_entry = float(order.get('price') or exchange.fetch_ticker(symbol_ccxt)['last'])
+                    print(f"✅ Market fallback KHỚP: {symbol_ccxt} @ {actual_entry}")
 
         # Đặt SL & TP với safety net
         sl_side = 'sell' if side == 'buy' else 'buy'
         tp_side = 'sell' if side == 'buy' else 'buy'
 
         try:
+            # SL: Giữ stop_market để đảm bảo cắt lỗ nhanh (an toàn > phí)
             exchange.create_order(symbol_ccxt, 'stop_market', sl_side, quantity,
                                   params={'stopPrice': sl, 'reduceOnly': True})
-            exchange.create_order(symbol_ccxt, 'take_profit_market', tp_side, quantity,
+
+            # TP: Dùng take_profit limit → khi trigger sẽ đặt limit → maker fee
+            exchange.create_order(symbol_ccxt, 'take_profit', tp_side, quantity, tp,
                                   params={'stopPrice': tp, 'reduceOnly': True})
         except Exception as sl_tp_err:
             # ===== SAFETY NET: SL/TP fail → đóng vị thế ngay lập tức =====
@@ -1336,7 +1405,9 @@ def execute_trade(symbol_ccxt, side, entry_price, sl_price, tp1_price):
 
         rr = round(tp_percent / sl_percent, 1) if sl_percent > 0 else 2.0
 
-        logging.info(f"OPEN {'LONG' if side == 'buy' else 'SHORT'} {symbol_ccxt} | Entry: {actual_entry:.6f} | SL: -{sl_percent:.3f}% | TP: +{tp_percent:.3f}%")
+        # Log chi tiết loại lệnh
+        entry_type = "LIMIT (maker)" if actual_entry == limit_price else "MARKET (fallback)"
+        logging.info(f"OPEN {'LONG' if side == 'buy' else 'SHORT'} {symbol_ccxt} | {entry_type} | Entry: {actual_entry:.6f} | SL: -{sl_percent:.3f}% | TP: +{tp_percent:.3f}%")
 
         return order, str(quantity), sl, tp, ""
 
@@ -1375,7 +1446,7 @@ def manage_trailing_sl():
 
             # Lấy nến gần nhất
             try:
-                ohlcv = exchange.fetch_ohlcv(sym, '3m', limit=5)
+                ohlcv = exchange.fetch_ohlcv(sym, INTERVAL, limit=5)
                 if len(ohlcv) < 2:
                     continue
                 last_close = ohlcv[-2][4]
@@ -2433,7 +2504,8 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict, last_sig
                         )
                         
                         if res and not err:
-                            actual_entry = res.get('price') or entry_price
+                            actual_entry = res.get('average') or res.get('price') or entry_price
+                            order_type_text = "📗 Limit (maker)" if res.get('type') == 'limit' else "📕 Market (taker)"
                             # Tính % SL & TP
                             if trade_side == 'buy':
                                 sl_pct = (actual_entry - sl_actual) / actual_entry * 100
@@ -2445,13 +2517,14 @@ def process_symbol(symbol: str, first_run: bool, last_signal_ids: dict, last_sig
                             
                             trade_msg = f"""✅ <b>VÀO LỆNH THÀNH CÔNG</b> ({tier})
 📍 {symbol_ccxt} | {side_text}
+{order_type_text} | TP: Limit (maker) | SL: Market
 💰 Position: <b>{total_vol} USDT</b> (Leverage {GLOBAL_LEVERAGE}x)
 📊 Margin: {TRADE_AMOUNT_USDT} USDT | Qty: {sz}
 💰 Entry: {actual_entry:.6f}
 🔴 SL: {sl_actual:.6f} <b>(-{sl_pct:.3f}%)</b>
 🟢 TP1: {tp_actual:.6f} <b>(+{tp_pct:.3f}%)</b> → RR 1:{rr_actual}"""
                             send_telegram_message(trade_msg)
-                            logging.info(f"AUTO-TRADE OPEN {side_text} {symbol} | Entry: {actual_entry:.6f} | SL: -{sl_pct:.3f}% | TP: +{tp_pct:.3f}%")
+                            logging.info(f"AUTO-TRADE OPEN {side_text} {symbol} | {order_type_text} | Entry: {actual_entry:.6f} | SL: -{sl_pct:.3f}% | TP: +{tp_pct:.3f}%")
                         else:
                             err_msg = f"❌ <b>LỖI VÀO LỆNH</b>: {err if err else 'Fail'} | {side_text} {symbol_ccxt}"
                             send_telegram_message(err_msg)
@@ -2772,9 +2845,12 @@ def tg_show_positions(message):
             time_str = datetime.fromtimestamp(ts / 1000, tz=TZ).strftime('%H:%M') if ts else "N/A"
 
             pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-            pnl_str = f"{pnl_emoji} <b>{pnl:+.4f} USDT</b> ({pnl_percent:+.2f}%)"
+            side_emoji = "📈" if pos_side == "LONG" else "📉"
 
-            msg += f"<code>{ts}</code> | {t_symbol} | <b>{t_side}</b> | {qty:.6f} @ {price:.6f} | PNL: <b>{pnl:+.4f}</b> USDT (phí {fee:.4f})\n"
+            msg += f"{side_emoji} <b>{symbol}</b> | {pos_side} | {leverage}x\n"
+            msg += f"   📊 Qty: {qty} @ Entry: {entry:.6f}\n"
+            msg += f"   {pnl_emoji} PNL: <b>{pnl:+.4f} USDT</b> ({pnl_percent:+.2f}%)\n"
+            msg += f"   ⏰ {time_str}\n\n"
 
         tg_bot.reply_to(message, msg, parse_mode='HTML')
     except Exception as e:
